@@ -1,0 +1,48 @@
+{
+  "scenario": "sensitive-batch-upload",
+  "description": "读取敏感工作区文件、归档并向首次出现的域名外发",
+  "expected": {
+    "observe": "Alert",
+    "strict": "Block"
+  },
+  "event": {
+    "process": {
+      "pid": 4242,
+      "executable": "/Applications/ExampleAI.app/Contents/MacOS/example-ai",
+      "name": "example-ai",
+      "version": "0.1-demo",
+      "signer": "Example AI",
+      "parent_pid": 101,
+      "parent_name": "zsh"
+    },
+    "network": {
+      "destination": {
+        "host": "upload.example.test",
+        "ip": "203.0.113.10",
+        "port": 443,
+        "protocol": "https"
+      },
+      "bytes_sent": 8000000,
+      "timestamp": "2026-09-22T09:00:00Z"
+    },
+    "file_events": [
+      {
+        "path": "/workspace/.env",
+        "kind": "Read",
+        "bytes": 1024,
+        "sha256": "fixture-env-hash",
+        "timestamp": "2026-09-22T08:59:45Z"
+      },
+      {
+        "path": "/workspace/.git/objects/pack/demo",
+        "kind": "Read",
+        "bytes": 6000000,
+        "sha256": "fixture-git-hash",
+        "timestamp": "2026-09-22T08:59:50Z"
+      }
+    ],
+    "archive_created": true,
+    "first_seen_destination": true,
+    "consent": null
+  }
+}

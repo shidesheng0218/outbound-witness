@@ -1,0 +1,18 @@
+{
+  "sensitive_path_fragments": [
+    "/.env",
+    "/.git/",
+    "/.ssh/",
+    "/Library/Application Support/Google/Chrome/",
+    "/AppData/Local/Google/Chrome/"
+  ],
+  "batch_file_count": 2,
+  "high_upload_bytes": 5242880,
+  "sensitive_path_points": 50,
+  "batch_read_points": 20,
+  "archive_points": 30,
+  "first_seen_points": 15,
+  "high_upload_points": 10,
+  "high_risk_threshold": 70
+}
+

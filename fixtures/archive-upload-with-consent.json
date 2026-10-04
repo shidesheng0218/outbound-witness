@@ -1,0 +1,47 @@
+{
+  "scenario": "archive-upload-with-consent",
+  "description": "用户对工作区和目标域名授予一次会话授权",
+  "expected": {
+    "strict": "Allow"
+  },
+  "event": {
+    "process": {
+      "pid": 4242,
+      "executable": "fixtures/bin/example-ai-agent",
+      "name": "example-ai",
+      "version": "0.1-demo",
+      "signer": "Example AI",
+      "parent_pid": 101,
+      "parent_name": "zsh"
+    },
+    "network": {
+      "destination": {
+        "host": "upload.example.test",
+        "ip": "203.0.113.10",
+        "port": 443,
+        "protocol": "https"
+      },
+      "bytes_sent": 8000000,
+      "timestamp": "2026-09-22T09:00:00Z"
+    },
+    "file_events": [
+      {
+        "path": "/workspace/release.zip",
+        "kind": "Read",
+        "bytes": 8000000,
+        "sha256": "fixture-release-hash",
+        "timestamp": "2026-09-22T08:59:50Z"
+      }
+    ],
+    "archive_created": true,
+    "first_seen_destination": true,
+    "consent": {
+      "executable_sha256": "c94658cc19708c4776fd813f2118777c061bfc216ad28a99f2f205df33a1217d",
+      "process_version": "0.1-demo",
+      "destination_host": "upload.example.test",
+      "path_prefix": "/workspace",
+      "expires_at": "2026-09-23T09:00:00Z",
+      "scope": "session"
+    }
+  }
+}

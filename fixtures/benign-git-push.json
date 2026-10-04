@@ -1,0 +1,41 @@
+{
+  "scenario": "benign-git-push",
+  "description": "开发工具向已知代码托管目标发送代码变更",
+  "expected": {
+    "observe": "Allow",
+    "strict": "Allow"
+  },
+  "event": {
+    "process": {
+      "pid": 6001,
+      "executable": "/usr/bin/git",
+      "name": "git",
+      "version": "2.45.0",
+      "signer": "Git",
+      "parent_pid": 101,
+      "parent_name": "zsh"
+    },
+    "network": {
+      "destination": {
+        "host": "git.example.test",
+        "ip": "203.0.113.11",
+        "port": 443,
+        "protocol": "https"
+      },
+      "bytes_sent": 64000,
+      "timestamp": "2026-09-22T09:00:00Z"
+    },
+    "file_events": [
+      {
+        "path": "/workspace/src/main.rs",
+        "kind": "Read",
+        "bytes": 2048,
+        "sha256": "fixture-source-hash",
+        "timestamp": "2026-09-22T08:59:50Z"
+      }
+    ],
+    "archive_created": false,
+    "first_seen_destination": false,
+    "consent": null
+  }
+}

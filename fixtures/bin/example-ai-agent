@@ -1,0 +1,5 @@
+#!/bin/sh
+# Demo agent binary for fixtures/archive-upload-with-consent.json.
+# The consent grant in that fixture binds to the SHA-256 of this file's
+# contents, demonstrating content-hash authorization instead of path matching.
+echo "example-ai demo agent v0.1"

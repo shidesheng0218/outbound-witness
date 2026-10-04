@@ -1,0 +1,15 @@
+[package]
+name = "outbound-witness-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# TLS client used only by the credential broker: it terminates the agent's
+# plain-HTTP request and makes its own verified HTTPS call upstream, so a
+# credential can be injected without decrypting any agent TLS session.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+

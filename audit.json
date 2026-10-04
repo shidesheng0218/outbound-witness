@@ -1,0 +1,88 @@
+{
+  "records": [
+    {
+      "event": {
+        "process": {
+          "pid": 4242,
+          "executable": "/Applications/ExampleAI.app/Contents/MacOS/example-ai",
+          "name": "example-ai",
+          "version": "0.1-demo",
+          "signer": "Example AI",
+          "parent_pid": 101,
+          "parent_name": "zsh"
+        },
+        "network": {
+          "destination": {
+            "host": "upload.example.test",
+            "ip": "203.0.113.10",
+            "port": 443,
+            "protocol": "https"
+          },
+          "bytes_sent": 8000000,
+          "timestamp": "2026-09-22T09:00:00Z"
+        },
+        "file_events": [
+          {
+            "path": "/workspace/.env",
+            "kind": "Read",
+            "bytes": 1024,
+            "sha256": "demo-env-hash",
+            "timestamp": "2026-09-22T08:59:45Z"
+          },
+          {
+            "path": "/workspace/.git/objects/pack/pack-demo",
+            "kind": "Read",
+            "bytes": 6000000,
+            "sha256": "demo-git-hash",
+            "timestamp": "2026-09-22T08:59:50Z"
+          }
+        ],
+        "archive_created": true,
+        "first_seen_destination": true,
+        "consent": {
+          "executable_sha256": "never-matches-demo",
+          "process_version": "0.1-demo",
+          "destination_host": "not-this-host",
+          "path_prefix": "/workspace",
+          "expires_at": null,
+          "scope": "session"
+        }
+      },
+      "evaluation": {
+        "risk_score": 100,
+        "signals": [
+          {
+            "code": "sensitive_path",
+            "points": 50,
+            "explanation": "读取了敏感路径: /workspace/.env, /workspace/.git/objects/pack/pack-demo"
+          },
+          {
+            "code": "batch_read",
+            "points": 20,
+            "explanation": "短时间关联到 2 个文件读取事件"
+          },
+          {
+            "code": "archive_before_upload",
+            "points": 30,
+            "explanation": "检测到文件归档行为并紧邻外部联网事件"
+          },
+          {
+            "code": "first_seen_destination",
+            "points": 15,
+            "explanation": "目标 upload.example.test 首次出现"
+          },
+          {
+            "code": "large_upload",
+            "points": 10,
+            "explanation": "单次外发流量达到 8000000 bytes"
+          }
+        ],
+        "decision": "Block",
+        "explanation": "读取了敏感路径: /workspace/.env, /workspace/.git/objects/pack/pack-demo；短时间关联到 2 个文件读取事件；检测到文件归档行为并紧邻外部联网事件；目标 upload.example.test 首次出现；单次外发流量达到 8000000 bytes",
+        "consent_applied": false
+      },
+      "previous_chain_hash": null,
+      "chain_hash": "2385ce4d4da0f92ba65ad08794ac60bd71c4728a147a3586a156bf4dc5d6f927"
+    }
+  ]
+}
