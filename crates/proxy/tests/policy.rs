@@ -317,7 +317,7 @@ fn grant_bound_to_port_does_not_cover_other_ports_on_same_host() {
         image_id: None,
     };
     assert_eq!(
-        evaluate_request(&request_on_port(443), &strict_config(), &[grant.clone()], 5_000),
+        evaluate_request(&request_on_port(443), &strict_config(), std::slice::from_ref(&grant), 5_000),
         ProxyDecision::Allow
     );
     assert_eq!(
@@ -355,7 +355,7 @@ fn denial_bound_to_port_does_not_block_other_ports() {
             &request_on_port(443),
             &strict_config(),
             &[],
-            &[denial.clone()],
+            std::slice::from_ref(&denial),
             5_000
         ),
         ProxyDecision::Block
@@ -420,7 +420,7 @@ fn pre_authorization_is_port_bound_and_expires() {
             &strict_config(),
             &[],
             &[],
-            &[expired.clone()],
+            std::slice::from_ref(&expired),
             1_000,
         )
         .decision,
@@ -451,7 +451,7 @@ fn wildcard_pre_authorization_covers_subdomains_and_bare_suffix_only() {
             &strict_config(),
             &[],
             &[],
-            &[wildcard.clone()],
+            std::slice::from_ref(&wildcard),
             5_000,
         )
         .decision

@@ -26,9 +26,11 @@ use crate::write_json;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Largest header block accepted from the agent.
 const MAX_HEADER_BYTES: usize = 32 * 1024;
-/// Largest upstream response buffered before relaying. Responses above this are
-/// refused rather than streamed, which is the documented limitation of v1.
-const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest upstream response relayed for one request. The response is streamed
+/// rather than buffered, so this only bounds the total bytes of one request.
+const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest upstream response header block accepted before giving up.
+const MAX_UPSTREAM_HEAD_BYTES: usize = 64 * 1024;
 
 /// One credential route. The secret itself is never stored here: the route only
 /// names the environment variable the broker resolves at request time.
@@ -264,7 +266,9 @@ fn write_error(stream: &mut TcpStream, status: &str, message: &str) {
     let _ = stream.flush();
 }
 
-fn tls_exchange(route: &CredentialRoute, request: &[u8]) -> Result<Vec<u8>, String> {
+fn tls_connect(
+    route: &CredentialRoute,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -277,27 +281,64 @@ fn tls_exchange(route: &CredentialRoute, request: &[u8]) -> Result<Vec<u8>, Stri
         .map_err(|_| format!("上游主机名无效: {}", route.upstream_host))?;
     let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| error.to_string())?;
-    let mut tls = rustls::StreamOwned::new(
+    Ok(rustls::StreamOwned::new(
         connection,
         TcpStream::connect((route.upstream_host.as_str(), route.upstream_port))
             .map_err(|error| format!("连接上游失败: {error}"))?,
-    );
-    tls.write_all(request).map_err(|error| error.to_string())?;
-    tls.flush().map_err(|error| error.to_string())?;
+    ))
+}
 
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8192];
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+/// Streams the upstream response to the client as it arrives. The header block
+/// is forwarded the moment it is complete, so a streaming upstream (SSE) reaches
+/// the agent without waiting for the whole body to finish.
+fn relay_response(upstream: &mut impl Read, client: &mut TcpStream) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut head = Vec::new();
+    let mut headers_forwarded = false;
+
     loop {
-        let count = tls.read(&mut buffer).map_err(|error| error.to_string())?;
+        let count = upstream.read(&mut buffer).map_err(|error| error.to_string())?;
         if count == 0 {
             break;
         }
-        response.extend_from_slice(&buffer[..count]);
-        if response.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err("上游响应超过 broker 缓冲上限".to_string());
+        total = total.saturating_add(count as u64);
+        if total > MAX_STREAM_BYTES {
+            return Err(format!("上游响应超过 {MAX_STREAM_BYTES} 字节上限，已中断"));
+        }
+        if headers_forwarded {
+            client
+                .write_all(&buffer[..count])
+                .map_err(|error| error.to_string())?;
+            client.flush().map_err(|error| error.to_string())?;
+            continue;
+        }
+        head.extend_from_slice(&buffer[..count]);
+        if find_header_end(&head).is_some() {
+            client.write_all(&head).map_err(|error| error.to_string())?;
+            client.flush().map_err(|error| error.to_string())?;
+            headers_forwarded = true;
+            head.clear();
+            continue;
+        }
+        if head.len() > MAX_UPSTREAM_HEAD_BYTES {
+            return Err("上游响应头超过上限".to_string());
         }
     }
-    Ok(response)
+
+    if !headers_forwarded && !head.is_empty() {
+        // The upstream closed before completing its header block. Pass on what
+        // arrived so the agent sees a truncated response instead of hanging.
+        client.write_all(&head).map_err(|error| error.to_string())?;
+    }
+    Ok(total)
 }
 
 fn next_broker_request_id(now_ms: u64) -> String {
@@ -393,17 +434,30 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
                 return Ok(());
             }
         };
-    let response = match tls_exchange(route, &upstream_request) {
-        Ok(response) => response,
+    let mut upstream = match tls_connect(route) {
+        Ok(upstream) => upstream,
         Err(error) => {
             write_error(&mut client, "502 Bad Gateway", &error);
             return Ok(());
         }
     };
-    client
-        .write_all(&response)
-        .map_err(|error| error.to_string())?;
-    let _ = client.flush();
+    if let Err(error) = upstream
+        .write_all(&upstream_request)
+        .and_then(|()| upstream.flush())
+    {
+        write_error(&mut client, "502 Bad Gateway", &format!("写入上游失败: {error}"));
+        return Ok(());
+    }
+    // Once the response starts streaming we can no longer send an HTTP error, so
+    // a relay failure is logged and the connection is simply closed.
+    let relayed = match relay_response(&mut upstream, &mut client) {
+        Ok(relayed) => relayed,
+        Err(error) => {
+            eprintln!("broker relay failed: {error}");
+            return Ok(());
+        }
+    };
+    eprintln!("broker relayed {relayed} bytes from {}", route.upstream_host);
     record_broker_request(state_dir, route, body.len() as u64)
 }
 
@@ -517,6 +571,12 @@ mod tests {
         let mut bad_env = route();
         bad_env.secret_env = "A B".into();
         assert!(bad_env.validate().is_err());
+    }
+
+    #[test]
+    fn finds_the_end_of_the_header_block() {
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n\r\nbody"), Some(19));
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n"), None);
     }
 
     #[test]

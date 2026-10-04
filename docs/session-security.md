@@ -22,7 +22,7 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 - 代理在自身进程环境里按 `secret_env` 解析密钥，向上游发起**独立且经过证书校验**的 HTTPS 请求，再注入 `header` 指定的头部；
 - agent 从不与该上游建立 TLS，因此这不属于解密 agent 的 HTTPS；
 - 代理只转发 `content-type`、`accept`、`anthropic-version`、`anthropic-beta`、`openai-beta`、`openai-organization` 这几个头部，其余（含 agent 自己塞的 `authorization`、`x-api-key`、`host`、`cookie`）一律丢弃；
-- 只接受 `Content-Length` 请求体（拒绝 chunked），请求体上限 16 MiB，响应在转发前完整缓冲，上限 64 MiB。
+- 只接受 `Content-Length` 请求体（拒绝 chunked），请求体上限 16 MiB；响应**流式转发**——响应头一到达就下发，因此 SSE 类流式接口不会被缓冲，单个请求总量上限 256 MiB。
 
 这引入了一个新的信任边界：**代理进程持有可直接使用的凭据**。不需要该能力时不要声明路由。
 
