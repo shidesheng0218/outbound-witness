@@ -19,7 +19,9 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 `--credential-routes` 声明的路由把密钥留在代理容器：
 
 - agent 容器只被注入 `OW_BROKER_<ROUTE>_BASE_URL=http://proxy:8080/<route>`，不含任何密钥；
-- 代理在自身进程环境里按 `secret_env` 解析密钥，向上游发起**独立且经过证书校验**的 HTTPS 请求，再注入 `header` 指定的头部；
+- 代理按路由声明的来源解析密钥：`secret_env`（代理容器环境变量）或 `secret_file`（代理状态目录内的文件，宿主机写入、权限 0600，agent 容器完全没有该目录的挂载）。二者必须且只能声明一个；
+- 短期凭据：路由可声明 `token_command`（例如云 CLI 打印临时 token），CLI 在会话启动时于**宿主机**执行它，把输出写入 `secret_file`。密钥始终不进入 agent 容器；
+- 代理向上游发起**独立且经过证书校验**的 HTTPS 请求，再注入 `header` 指定的头部；
 - agent 从不与该上游建立 TLS，因此这不属于解密 agent 的 HTTPS；
 - 代理只转发 `content-type`、`accept`、`anthropic-version`、`anthropic-beta`、`openai-beta`、`openai-organization` 这几个头部，其余（含 agent 自己塞的 `authorization`、`x-api-key`、`host`、`cookie`）一律丢弃；
 - 只接受 `Content-Length` 请求体（拒绝 chunked），请求体上限 16 MiB；响应**流式转发**——响应头一到达就下发，因此 SSE 类流式接口不会被缓冲，单个请求总量上限 256 MiB。

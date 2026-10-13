@@ -61,6 +61,82 @@ fn prepared_session_persists_sanitized_snapshot_and_never_copies_secret() {
 }
 
 #[test]
+fn token_command_writes_a_private_credential_file_that_never_enters_the_record() {
+    let workspace = temp_dir("cred-workspace");
+    let state = temp_dir("cred-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+
+    let routes_path = state.join("routes.json");
+    fs::write(
+        &routes_path,
+        r#"[{"route":"cloud","upstream_host":"api.example.test","header":"authorization","secret_file":"credentials/cloud","token_command":["sh","-c","printf %s short-lived-token"]}]"#,
+    )
+    .unwrap();
+
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    spec.credential_routes_path = Some(routes_path.display().to_string());
+    let record = prepare_session(spec).expect("session should prepare");
+
+    let secret_path = state
+        .join(&record.spec.id)
+        .join("proxy-state")
+        .join("credentials")
+        .join("cloud");
+    assert_eq!(
+        fs::read_to_string(&secret_path).unwrap(),
+        "short-lived-token"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the credential file must not be group or world readable");
+    }
+
+    assert_eq!(record.spec.credential_routes.len(), 1);
+    assert_eq!(
+        record.spec.credential_routes[0].secret_file.as_deref(),
+        Some("credentials/cloud")
+    );
+    let serialized = serde_json::to_string(&record).unwrap();
+    assert!(
+        !serialized.contains("short-lived-token"),
+        "the credential value must never be written into the session record"
+    );
+}
+
+#[test]
+fn a_failing_token_command_aborts_the_session() {
+    let workspace = temp_dir("cred-fail-workspace");
+    let state = temp_dir("cred-fail-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+
+    let routes_path = state.join("routes.json");
+    fs::write(
+        &routes_path,
+        r#"[{"route":"cloud","upstream_host":"api.example.test","header":"authorization","secret_file":"credentials/cloud","token_command":["sh","-c","echo boom >&2; exit 3"]}]"#,
+    )
+    .unwrap();
+
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    spec.credential_routes_path = Some(routes_path.display().to_string());
+    let error = prepare_session(spec).expect_err("a failing token command must abort the session");
+    assert!(error.contains("token_command 失败"), "unexpected error: {error}");
+    assert!(error.contains("boom"), "the command stderr should be surfaced: {error}");
+}
+
+#[test]
 fn pre_authorizations_are_seeded_at_start_and_manageable_via_cli() {
     let workspace = temp_dir("preauth-workspace");
     let state = temp_dir("preauth-state");

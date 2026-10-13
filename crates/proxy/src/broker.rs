@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,8 +32,12 @@ const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest upstream response header block accepted before giving up.
 const MAX_UPSTREAM_HEAD_BYTES: usize = 64 * 1024;
 
-/// One credential route. The secret itself is never stored here: the route only
-/// names the environment variable the broker resolves at request time.
+/// One credential route. The secret value itself is never stored here: the route
+/// only says where the broker should resolve it at request time.
+///
+/// Exactly one of `secret_env` or `secret_file` must be set. A file source lets
+/// the host rotate a short-lived credential (see `token_command`) without
+/// restarting the proxy, and it never passes through the agent container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialRoute {
     /// First path segment the agent calls, e.g. "anthropic".
@@ -45,7 +49,16 @@ pub struct CredentialRoute {
     /// Header the credential is injected into, e.g. "x-api-key".
     pub header: String,
     /// Name of the broker-side environment variable holding the secret.
-    pub secret_env: String,
+    #[serde(default)]
+    pub secret_env: Option<String>,
+    /// Path to the secret, relative to the proxy state directory. The host
+    /// writes this file; the agent container never mounts that directory.
+    #[serde(default)]
+    pub secret_file: Option<String>,
+    /// Command the CLI runs on the host at session start to produce the secret
+    /// for `secret_file`, e.g. a cloud CLI printing a short-lived token.
+    #[serde(default)]
+    pub token_command: Option<Vec<String>>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -74,15 +87,68 @@ impl CredentialRoute {
         if !is_valid_header_name(&self.header) {
             return Err(format!("凭据注入头名称无效: {}", self.header));
         }
-        if self.secret_env.is_empty()
-            || !self
-                .secret_env
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(format!("凭据环境变量名无效: {}", self.secret_env));
+        let env_name = self.secret_env.as_deref().filter(|name| !name.is_empty());
+        let file_path = self.secret_file.as_deref().filter(|path| !path.is_empty());
+        match (env_name, file_path) {
+            (Some(name), None) => {
+                if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err(format!("凭据环境变量名无效: {name}"));
+                }
+            }
+            (None, Some(path)) => {
+                let path = Path::new(path);
+                if path.is_absolute()
+                    || path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(format!(
+                        "凭据文件必须是 state 目录内的相对路径: {}",
+                        path.display()
+                    ));
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err("凭据路由只能声明 secret_env 或 secret_file 其中之一".to_string());
+            }
+            (None, None) => {
+                return Err("凭据路由需要 secret_env 或 secret_file".to_string());
+            }
+        }
+        if let Some(command) = &self.token_command {
+            if command.is_empty() {
+                return Err("token_command 不能为空".to_string());
+            }
+            if file_path.is_none() {
+                return Err("token_command 只能配合 secret_file 使用".to_string());
+            }
         }
         Ok(())
+    }
+}
+
+/// Resolves the credential for one request. A file source wins so the host can
+/// rotate a short-lived token while the session is running.
+pub fn resolve_secret(state_dir: &Path, route: &CredentialRoute) -> Result<String, String> {
+    if let Some(relative) = route.secret_file.as_deref().filter(|path| !path.is_empty()) {
+        let path = state_dir.join(relative);
+        let value = fs::read_to_string(&path)
+            .map_err(|error| format!("无法读取凭据文件 {}: {error}", path.display()))?;
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
+        if value.is_empty() {
+            return Err(format!("凭据文件为空: {}", path.display()));
+        }
+        return Ok(value);
+    }
+    match route.secret_env.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) => match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Err(format!("broker 缺少凭据环境变量 {name}")),
+        },
+        None => Err("凭据路由没有可用的凭据来源".to_string()),
     }
 }
 
@@ -408,14 +474,10 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
         );
         return Ok(());
     };
-    let secret = match std::env::var(&route.secret_env) {
-        Ok(value) if !value.is_empty() => value,
-        _ => {
-            write_error(
-                &mut client,
-                "502 Bad Gateway",
-                &format!("broker 缺少凭据环境变量 {}", route.secret_env),
-            );
+    let secret = match resolve_secret(state_dir, route) {
+        Ok(secret) => secret,
+        Err(error) => {
+            write_error(&mut client, "502 Bad Gateway", &error);
             return Ok(());
         }
     };
@@ -489,7 +551,9 @@ mod tests {
             upstream_host: "api.example.test".into(),
             upstream_port: 443,
             header: "x-api-key".into(),
-            secret_env: "ANTHROPIC_API_KEY".into(),
+            secret_env: Some("ANTHROPIC_API_KEY".into()),
+            secret_file: None,
+            token_command: None,
             note: None,
         }
     }
@@ -569,8 +633,63 @@ mod tests {
         bad_header.header = "x-api-key: injected".into();
         assert!(bad_header.validate().is_err());
         let mut bad_env = route();
-        bad_env.secret_env = "A B".into();
+        bad_env.secret_env = Some("A B".into());
         assert!(bad_env.validate().is_err());
+    }
+
+    #[test]
+    fn requires_exactly_one_credential_source() {
+        let mut both = route();
+        both.secret_file = Some("credentials/anthropic".into());
+        assert!(both.validate().is_err(), "two sources must be refused");
+
+        let mut neither = route();
+        neither.secret_env = None;
+        assert!(neither.validate().is_err(), "no source must be refused");
+
+        let mut file_only = route();
+        file_only.secret_env = None;
+        file_only.secret_file = Some("credentials/anthropic".into());
+        assert!(file_only.validate().is_ok());
+
+        let mut escaping = route();
+        escaping.secret_env = None;
+        escaping.secret_file = Some("../outside".into());
+        assert!(escaping.validate().is_err(), "path escape must be refused");
+
+        let mut orphan_command = route();
+        orphan_command.token_command = Some(vec!["echo".into()]);
+        assert!(
+            orphan_command.validate().is_err(),
+            "token_command without secret_file must be refused"
+        );
+    }
+
+    #[test]
+    fn resolves_secrets_from_files_and_reports_missing_sources() {
+        let dir = std::env::temp_dir().join(format!("ow-broker-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("credentials")).unwrap();
+        std::fs::write(dir.join("credentials/anthropic"), "file-secret\n").unwrap();
+
+        let mut file_route = route();
+        file_route.secret_env = None;
+        file_route.secret_file = Some("credentials/anthropic".into());
+        assert_eq!(
+            resolve_secret(&dir, &file_route).unwrap(),
+            "file-secret",
+            "the trailing newline must be trimmed"
+        );
+
+        let mut missing = file_route.clone();
+        missing.secret_file = Some("credentials/absent".into());
+        assert!(resolve_secret(&dir, &missing).is_err());
+
+        let mut env_route = route();
+        env_route.secret_env = Some("OW_TEST_ABSENT_ENV_VAR".into());
+        assert!(resolve_secret(&dir, &env_route).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

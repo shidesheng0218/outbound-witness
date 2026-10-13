@@ -58,7 +58,8 @@ fn credentials_reach_the_proxy_container_and_never_the_agent() {
         route: "anthropic".into(),
         upstream_host: "api.anthropic.com".into(),
         upstream_port: 443,
-        secret_env: "ANTHROPIC_API_KEY".into(),
+        secret_env: Some("ANTHROPIC_API_KEY".into()),
+        secret_file: None,
     }];
 
     let agent = build_docker_agent_args(&spec, Path::new("/tmp/snapshot"), "ow-internal", "proxy");

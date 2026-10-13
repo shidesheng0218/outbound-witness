@@ -154,7 +154,13 @@ pub struct CredentialRouteSummary {
     pub route: String,
     pub upstream_host: String,
     pub upstream_port: u16,
-    pub secret_env: String,
+    /// Name of the proxy-side environment variable, when the route uses one.
+    #[serde(default)]
+    pub secret_env: Option<String>,
+    /// Proxy-state-relative path to a host-written secret file, when the route
+    /// uses one. A short-lived token produced by token_command lands here.
+    #[serde(default)]
+    pub secret_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

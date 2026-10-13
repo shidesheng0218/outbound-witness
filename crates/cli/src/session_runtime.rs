@@ -309,8 +309,10 @@ pub fn build_proxy_args(
     // Credentials are passed to the proxy container only, by variable name, so
     // the host environment supplies the value and the agent never sees it.
     for route in &spec.credential_routes {
-        args.push("-e".into());
-        args.push(route.secret_env.clone());
+        if let Some(name) = &route.secret_env {
+            args.push("-e".into());
+            args.push(name.clone());
+        }
     }
     args.push("outbound-witness/proxy:local".into());
     args
@@ -730,6 +732,31 @@ pub fn prepare_session(mut spec: SessionSpec) -> Result<SessionRecord, String> {
         }
         write_json(&proxy_state_dir.join("broker.json"), &routes)
             .map_err(|error| error.to_string())?;
+        // A short-lived credential is produced on the host and written next to
+        // the proxy state, which the agent container never mounts.
+        for route in &routes {
+            let Some(command) = &route.token_command else {
+                continue;
+            };
+            let output = Command::new(&command[0])
+                .args(&command[1..])
+                .output()
+                .map_err(|error| format!("执行 token_command 失败（{}）: {error}", route.route))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "token_command 失败（{}）：{}",
+                    route.route,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if secret.is_empty() {
+                return Err(format!("token_command 没有输出凭据（{}）", route.route));
+            }
+            let credentials_dir = proxy_state_dir.join("credentials");
+            fs::create_dir_all(&credentials_dir).map_err(|error| error.to_string())?;
+            write_secret_file(&credentials_dir.join(&route.route), &secret)?;
+        }
         spec.credential_routes = routes
             .iter()
             .map(|route| CredentialRouteSummary {
@@ -737,6 +764,7 @@ pub fn prepare_session(mut spec: SessionSpec) -> Result<SessionRecord, String> {
                 upstream_host: route.upstream_host.clone(),
                 upstream_port: route.upstream_port,
                 secret_env: route.secret_env.clone(),
+                secret_file: route.secret_file.clone(),
             })
             .collect();
     }
@@ -1182,6 +1210,27 @@ fn spec_from_command(command: &CliCommand) -> Result<SessionSpec, String> {
 }
 
 /// Parses a host:port entry from --allow-host into a session-scoped rule.
+/// Writes a credential file only the owner can read. The host writes it; the
+/// agent container has no mount for the proxy state directory at all.
+#[cfg(unix)]
+fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("无法写入凭据文件 {}: {error}", path.display()))?;
+    io::Write::write_all(&mut file, value.as_bytes())
+        .map_err(|error| format!("无法写入凭据文件 {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
+    fs::write(path, value).map_err(|error| format!("无法写入凭据文件 {}: {error}", path.display()))
+}
+
 fn parse_pre_authorization(entry: &str) -> Result<PreAuthorization, String> {
     let (host, port) = entry
         .rsplit_once(':')

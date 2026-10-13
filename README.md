@@ -24,7 +24,8 @@
 - Session 的代码改动只能落在隔离副本；必须先查看 diff，再以 `--path` 明确选择写回宿主工作区。
 - 写回前会核对宿主文件是否仍等于 diff 记录的 `before_sha256`，并拒绝经过符号链接的路径；发现冲突时整次写回中止，宿主文件保持原样。
 - 本地 CONNECT proxy 不解密 HTTPS；严格模式对未授权 HTTPS 目标默认暂停最多 120 秒，用户可用 `approve` 或 `deny` 写入本地控制文件。`once` 只放行这一次请求，`host` 放行该主机直到 `--ttl`，`session` 放行该主机直到会话结束且不看 TTL。批准同时绑定该请求的目标端口，摘要不一致或端口不一致则代理拒绝放行；`host` 与 `session` 只覆盖同一主机与同一端口，旧版缺少端口字段的授权按任意端口兼容。
-- 凭据可以完全不进入 agent 容器：用 `--credential-routes` 指向一份路由文件后，代理用**自身进程环境**里的密钥向上游发起独立的、经过证书校验的 HTTPS 调用并注入指定头部。agent 只拿到 `http://proxy:8080/<route>` 这个地址（以及一个不含密钥的 `OW_BROKER_<ROUTE>_BASE_URL` 变量），拿不到密钥本身。因为 agent 从不与该上游建立 TLS，所以这不涉及解密 agent 的 HTTPS；代价是代理进程成为持有可用凭据的新信任边界。路由文件格式见 `config/credential-routes.example.json`。
+- 凭据可以完全不进入 agent 容器：用 `--credential-routes` 指向一份路由文件后，代理用**自身进程环境**里的密钥向上游发起独立的、经过证书校验的 HTTPS 调用并注入指定头部。agent 只拿到 `http://proxy:8080/<route>` 这个地址（以及一个不含密钥的 `OW_BROKER_<ROUTE>_BASE_URL` 变量），拿不到密钥本身。因为 agent 从不与该上游建立 TLS，所以这不涉及解密 agent 的 HTTPS；代价是代理进程成为持有可用凭据的新信任边界。
+  凭据来源有两种，路由必须且只能声明一个：`secret_env`（代理容器环境变量）或 `secret_file`（代理状态目录内的文件，权限 0600）。声明 `secret_file` 时可再声明 `token_command`——CLI 会在**宿主机**执行它来换取短期凭据（例如云 CLI 打印临时 token），输出写入该文件。agent 容器没有该目录的任何挂载，因此无论哪种来源密钥都不会进入 agent。路由文件格式见 `config/credential-routes.example.json`。
 - 预授权策略用于消除逐条审批的摩擦：启动时用可重复的 `--allow-host host:port`，或运行中用 `session preauth add <id> --host <h> --port <p> [--ttl 秒]` 声明。命中的 CONNECT 直接放行、不再暂停等待人工；规则始终绑定端口、可设 TTL、可用 `session preauth list/remove` 管理。审计会区分"预授权策略自动放行"与"人工批准"，二者不会混为一谈。
 - Docker Session 使用内部网络、强制代理环境变量、`--cap-drop ALL` 和 `no-new-privileges`；不使用 privileged、host network 或 Docker socket。
 - 桌面 UI 可调用 runtime 诊断、Session 启动和状态列表。
