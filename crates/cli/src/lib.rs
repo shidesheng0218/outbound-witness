@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 pub mod session_runtime;
+pub mod signing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliCommand {
@@ -36,6 +37,8 @@ pub struct CliCommand {
     pub note: Option<String>,
     /// Host-side JSON file describing credential broker routes.
     pub credential_routes: Option<String>,
+    /// Expected Ed25519 public key (hex or file) when verifying audit origin.
+    pub pubkey: Option<String>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
@@ -66,6 +69,14 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
             }
             "--json" => {
                 command.json = true;
+                index += 1;
+            }
+            "--pubkey" => {
+                command.pubkey = Some(required_value(args, &mut index, "--pubkey")?);
+                index += 1;
+            }
+            "--state-dir" => {
+                command.state_dir = Some(required_value(args, &mut index, "--state-dir")?);
                 index += 1;
             }
             "--export" => {
@@ -103,32 +114,51 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
 /// Re-derives the audit hash chain of an exported session record. Anyone can run
 /// this without trusting the process that produced the file: a single edited,
 /// reordered, or removed record makes the chain stop matching.
-fn verify_audit_file(path: &Path, json: bool) -> Result<String, String> {
+fn verify_audit_file(
+    path: &Path,
+    json: bool,
+    public_key: Option<&str>,
+) -> Result<String, String> {
     let source = fs::read_to_string(path)
         .map_err(|error| format!("无法读取审计文件 {}: {error}", path.display()))?;
     let record: SessionRecord = serde_json::from_str(&source)
         .map_err(|error| format!("审计文件不是有效的 Session 导出: {error}"))?;
-    match record.verify_audit_chain() {
-        Ok(()) => {
-            if json {
-                Ok(format!(
-                    "{{\"verified\":true,\"records\":{},\"session\":\"{}\"}}",
-                    record.audit.len(),
-                    record.spec.id
-                ))
-            } else {
-                Ok(format!(
-                    "审计链校验通过：{} 条记录，Session {}",
-                    record.audit.len(),
-                    record.spec.id
-                ))
-            }
-        }
-        Err((index, reason)) => Err(format!(
+    if let Err((index, reason)) = record.verify_audit_chain() {
+        return Err(format!(
             "审计链校验失败：第 {} 条记录（共 {} 条）— {reason}",
             index + 1,
             record.audit.len()
-        )),
+        ));
+    }
+    // The chain proves the file was not altered. Only a signature checked
+    // against a key from a trusted channel says who produced it, so the origin
+    // verdict is reported separately instead of being folded into the chain.
+    let origin = match public_key {
+        Some(value) => {
+            let expected = signing::read_public_key_argument(value)?;
+            signing::verify_record(&record, &expected)
+                .map_err(|error| format!("来源校验失败：{error}"))?;
+            "来源可信（签名与提供的公钥匹配）".to_string()
+        }
+        None => match &record.signature {
+            Some(_) => "签名存在，但未提供 --pubkey，未校验来源".to_string(),
+            None => "该导出没有签名".to_string(),
+        },
+    };
+    if json {
+        Ok(format!(
+            "{{\"verified\":true,\"records\":{},\"session\":\"{}\",\"origin\":\"{}\"}}",
+            record.audit.len(),
+            record.spec.id,
+            origin
+        ))
+    } else {
+        Ok(format!(
+            "审计链校验通过：{} 条记录，Session {}\n{}",
+            record.audit.len(),
+            record.spec.id,
+            origin
+        ))
     }
 }
 
@@ -157,6 +187,7 @@ impl Default for CliCommand {
             port: None,
             note: None,
             credential_routes: None,
+            pubkey: None,
         }
     }
 }
@@ -350,7 +381,12 @@ pub fn run(args: Vec<String>) -> Result<String, String> {
         "verify" => verify_audit_file(
             Path::new(command.input.as_deref().unwrap()),
             command.json,
+            command.pubkey.as_deref(),
         ),
+        "pubkey" => {
+            let state_dir = session_runtime::state_dir_for(&command)?;
+            signing::public_key_hex(&state_dir)
+        }
         "evaluate" => render_evaluation(
             load_event_file(command.input.as_deref().unwrap())?,
             &command,

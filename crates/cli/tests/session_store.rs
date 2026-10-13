@@ -61,6 +61,88 @@ fn prepared_session_persists_sanitized_snapshot_and_never_copies_secret() {
 }
 
 #[test]
+fn export_signs_the_record_and_origin_verification_requires_the_right_key() {
+    let workspace = temp_dir("sign-workspace");
+    let state = temp_dir("sign-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).expect("session should prepare");
+
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).expect("export should succeed");
+
+    let public_key = run(vec![
+        "outbound-witness".into(),
+        "pubkey".into(),
+        "--state-dir".into(),
+        state.display().to_string(),
+    ])
+    .expect("pubkey should print")
+    .trim()
+    .to_string();
+    assert_eq!(public_key.len(), 64, "an ed25519 public key is 32 bytes of hex");
+
+    // Chain-only: the file is intact, but the origin is not claimed.
+    let chain_only = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        output.display().to_string(),
+    ])
+    .expect("the chain alone should verify");
+    assert!(
+        chain_only.contains("未提供 --pubkey"),
+        "origin must not be claimed without a key: {chain_only}"
+    );
+
+    let verified = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        output.display().to_string(),
+        "--pubkey".into(),
+        public_key,
+    ])
+    .expect("the right key must verify");
+    assert!(verified.contains("来源可信"), "unexpected output: {verified}");
+
+    let other_state = temp_dir("sign-other-state");
+    let other_key = run(vec![
+        "outbound-witness".into(),
+        "pubkey".into(),
+        "--state-dir".into(),
+        other_state.display().to_string(),
+    ])
+    .expect("pubkey should print")
+    .trim()
+    .to_string();
+    let error = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        output.display().to_string(),
+        "--pubkey".into(),
+        other_key,
+    ])
+    .expect_err("a foreign key must not verify");
+    assert!(error.contains("来源校验失败"), "unexpected error: {error}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(state.join("signing-key.pk8"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the private key must not be group or world readable");
+    }
+}
+
+#[test]
 fn exported_audit_carries_a_verifiable_chain_and_detects_tampering() {
     let workspace = temp_dir("chain-workspace");
     let state = temp_dir("chain-state");

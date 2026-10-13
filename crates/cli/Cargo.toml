@@ -10,3 +10,6 @@ outbound-witness-core = { path = "../core" }
 outbound-witness-proxy = { path = "../proxy" }
 serde.workspace = true
 serde_json.workspace = true
+# Ed25519 for audit signatures. Already present in the lock file as a rustls
+# dependency, so this adds no new download.
+ring = "0.17"

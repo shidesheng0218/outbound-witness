@@ -270,6 +270,17 @@ pub struct SessionAuditRecord {
     pub proxy_request_id: Option<String>,
 }
 
+/// Detached signature over an exported session record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditSignature {
+    pub algorithm: String,
+    /// Public key that produced the signature, hex encoded. Convenience only: a
+    /// verifier must compare it against a key obtained from a trusted channel,
+    /// because anyone can mint a key pair and sign a fabricated record.
+    pub public_key: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
     pub spec: SessionSpec,
@@ -286,6 +297,10 @@ pub struct SessionRecord {
     /// trusting the process that produced the file.
     #[serde(default)]
     pub audit_chain: Vec<String>,
+    /// Ed25519 signature produced at export time. A hash chain proves the file
+    /// was not altered; the signature is what can prove who produced it.
+    #[serde(default)]
+    pub signature: Option<AuditSignature>,
     pub error: Option<String>,
 }
 
@@ -302,6 +317,7 @@ impl SessionRecord {
             network_intents: Vec::new(),
             audit: Vec::new(),
             audit_chain: Vec::new(),
+            signature: None,
             error: None,
         }
     }

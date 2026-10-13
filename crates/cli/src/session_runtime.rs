@@ -180,7 +180,10 @@ pub fn run_session_command(command: &CliCommand) -> Result<String, String> {
                 .as_deref()
                 .ok_or_else(|| "session export 需要 --output".to_string())?;
             export_session_audit(&state, session_id, Path::new(output))?;
-            Ok(format!("审计已导出: {output}"))
+            let public_key = crate::signing::public_key_hex(&state)?;
+            Ok(format!(
+                "审计已导出: {output}\n已用本机签名密钥签名。公钥（交给验证方，用于确认来源）:\n{public_key}"
+            ))
         }
         "approve" => approve_request(command),
         "deny" => deny_request(command),
@@ -989,8 +992,9 @@ pub fn export_session_audit(
 ) -> Result<(), String> {
     let mut record = load_session_record(state_dir, session_id)?;
     // Chain the audit before exporting so the file carries a verifiable digest
-    // over its own contents.
+    // over its own contents, then sign it so the origin can be checked.
     record.chain_audit();
+    crate::signing::sign_record(state_dir, &mut record)?;
     let rendered = if output.extension().and_then(|value| value.to_str()) == Some("html") {
         audit_html(&record)?
     } else {
@@ -1173,6 +1177,12 @@ fn render_diff(command: &CliCommand) -> Result<String, String> {
         .map(|entry| format!("{:?}\t{}", entry.kind, entry.relative_path))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// State directory for a command, exposed so non-session commands can locate
+/// the signing key that lives beside the session records.
+pub fn state_dir_for(command: &CliCommand) -> Result<PathBuf, String> {
+    command_state_dir(command)
 }
 
 fn command_state_dir(command: &CliCommand) -> Result<PathBuf, String> {

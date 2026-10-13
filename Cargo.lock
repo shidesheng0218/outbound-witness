@@ -119,6 +119,7 @@ version = "0.2.0"
 dependencies = [
  "outbound-witness-core",
  "outbound-witness-proxy",
+ "ring",
  "serde",
  "serde_json",
 ]

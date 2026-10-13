@@ -19,6 +19,7 @@
 - 离线授权会校验可执行文件内容哈希、目标域名、目标端口、目录范围和 RFC3339 过期时间；过期时间无法解析时授权不匹配。旧版未记录端口的授权文件按"任意端口"兼容处理。
 - 可执行文件哈希指文件内容的 SHA-256，不是路径；事件未提供且文件无法读取时，授权不匹配（失败关闭）。
 - 审计记录采用前序哈希链，导出 JSON，不存文件正文。`session export` 会在导出前重新计算链，`outbound-witness verify <audit.json>` 可**独立重新推导并校验**：改动、重排或删除任意一条记录都会导致校验失败（非零退出码）。
+- 导出时还会用本机 Ed25519 密钥签名（首次导出自动生成，私钥以 0600 存于状态目录）。`outbound-witness pubkey` 打印公钥，`verify --pubkey <公钥或文件>` 可进一步确认**来源**。注意：**公钥必须来自你自己信任的渠道**——文件内嵌的公钥只是方便对照，本身不构成证据。不提供 `--pubkey` 时 verify 只报"链完整"，不会声称来源可信。
 - CLI 提供状态查看、演示事件和审计导出。
 - 通过 `outbound-witness session start` 创建隔离工作区副本，默认不复制 `.env`、`.git`、`.ssh`、浏览器配置，以及 `.aws`、`.kube`、`.docker`、`.gnupg`、`.npmrc`、`.netrc`、`.pypirc`、`.git-credentials`、`.pgpass` 和 `id_rsa`/`id_ed25519`/`id_ecdsa` 这类凭据存储与私钥。
 - Session 的代码改动只能落在隔离副本；必须先查看 diff，再以 `--path` 明确选择写回宿主工作区。
@@ -55,6 +56,8 @@ cargo run -p outbound-witness -- session diff <session-id>
 cargo run -p outbound-witness -- session apply <session-id> --path src/main.rs
 cargo run -p outbound-witness -- session export <session-id> --output audit.json
 cargo run -p outbound-witness -- verify audit.json
+cargo run -p outbound-witness -- pubkey
+cargo run -p outbound-witness -- verify audit.json --pubkey <对方给你的公钥>
 ```
 
 严格模式的演示应输出 `BLOCK 阻断`；观察模式的同一事件应输出 `ALERT 告警`。
