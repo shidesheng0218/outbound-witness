@@ -61,6 +61,69 @@ fn prepared_session_persists_sanitized_snapshot_and_never_copies_secret() {
 }
 
 #[test]
+fn exported_audit_carries_a_verifiable_chain_and_detects_tampering() {
+    let workspace = temp_dir("chain-workspace");
+    let state = temp_dir("chain-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).expect("session should prepare");
+
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).expect("export should succeed");
+
+    let verified = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        output.display().to_string(),
+    ])
+    .expect("an untampered export must verify");
+    assert!(verified.contains("校验通过"), "unexpected output: {verified}");
+
+    // Editing any audit field must break the chain.
+    let mut tampered: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    tampered["audit"][0]["policy_version"] = serde_json::json!("forged");
+    let tampered_path = state.join("tampered.json");
+    fs::write(
+        &tampered_path,
+        serde_json::to_string_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+
+    let error = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        tampered_path.display().to_string(),
+    ])
+    .expect_err("a tampered audit must fail verification");
+    assert!(error.contains("校验失败"), "unexpected error: {error}");
+
+    // Dropping a record must also break the chain.
+    let mut shortened: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    shortened["audit_chain"] = serde_json::json!([]);
+    let shortened_path = state.join("shortened.json");
+    fs::write(
+        &shortened_path,
+        serde_json::to_string_pretty(&shortened).unwrap(),
+    )
+    .unwrap();
+    let error = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        shortened_path.display().to_string(),
+    ])
+    .expect_err("a shortened chain must fail verification");
+    assert!(error.contains("校验失败"), "unexpected error: {error}");
+}
+
+#[test]
 fn token_command_writes_a_private_credential_file_that_never_enters_the_record() {
     let workspace = temp_dir("cred-workspace");
     let state = temp_dir("cred-state");

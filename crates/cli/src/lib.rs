@@ -1,9 +1,11 @@
+use outbound_witness_core::session::SessionRecord;
 use outbound_witness_core::{
     evaluate_event, AuditLedger, ConsentGrant, Destination, EnforcementMode, EvaluationResult,
     FileEvent, FileEventKind, NetworkEvent, PolicyDecision, ProcessIdentity, RuleConfig,
     WitnessEvent,
 };
 use std::fs;
+use std::path::Path;
 
 pub mod session_runtime;
 
@@ -82,13 +84,52 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
                 command.input = Some(value.to_string());
                 index += 1;
             }
+            value if command.name == "verify" && command.input.is_none() => {
+                command.input = Some(value.to_string());
+                index += 1;
+            }
             value => return Err(format!("未知参数: {value}")),
         }
     }
     if command.name == "evaluate" && command.input.is_none() {
         return Err("evaluate 需要事件或 benchmark JSON 文件路径".into());
     }
+    if command.name == "verify" && command.input.is_none() {
+        return Err("verify 需要一个导出的审计 JSON 路径".into());
+    }
     Ok(command)
+}
+
+/// Re-derives the audit hash chain of an exported session record. Anyone can run
+/// this without trusting the process that produced the file: a single edited,
+/// reordered, or removed record makes the chain stop matching.
+fn verify_audit_file(path: &Path, json: bool) -> Result<String, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("无法读取审计文件 {}: {error}", path.display()))?;
+    let record: SessionRecord = serde_json::from_str(&source)
+        .map_err(|error| format!("审计文件不是有效的 Session 导出: {error}"))?;
+    match record.verify_audit_chain() {
+        Ok(()) => {
+            if json {
+                Ok(format!(
+                    "{{\"verified\":true,\"records\":{},\"session\":\"{}\"}}",
+                    record.audit.len(),
+                    record.spec.id
+                ))
+            } else {
+                Ok(format!(
+                    "审计链校验通过：{} 条记录，Session {}",
+                    record.audit.len(),
+                    record.spec.id
+                ))
+            }
+        }
+        Err((index, reason)) => Err(format!(
+            "审计链校验失败：第 {} 条记录（共 {} 条）— {reason}",
+            index + 1,
+            record.audit.len()
+        )),
+    }
 }
 
 impl Default for CliCommand {
@@ -306,6 +347,10 @@ pub fn run(args: Vec<String>) -> Result<String, String> {
             }
         }
         "demo" => render_evaluation(demo_event(), &command),
+        "verify" => verify_audit_file(
+            Path::new(command.input.as_deref().unwrap()),
+            command.json,
+        ),
         "evaluate" => render_evaluation(
             load_event_file(command.input.as_deref().unwrap())?,
             &command,

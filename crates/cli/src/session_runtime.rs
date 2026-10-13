@@ -240,7 +240,14 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
             &internal_network,
             "proxy",
         );
+        // Short-lived credentials are renewed while the agent runs, so a long
+        // session does not outlive its token.
+        let refresh = spawn_credential_refresh(
+            read_json_vec::<CredentialRoute>(&prepared.proxy_state_dir.join("broker.json")),
+            prepared.proxy_state_dir.clone(),
+        );
         let output = run_docker_output(&agent_args)?;
+        refresh.stop();
         record.state = if output.status_success {
             SessionState::Completed
         } else {
@@ -735,27 +742,11 @@ pub fn prepare_session(mut spec: SessionSpec) -> Result<SessionRecord, String> {
         // A short-lived credential is produced on the host and written next to
         // the proxy state, which the agent container never mounts.
         for route in &routes {
-            let Some(command) = &route.token_command else {
+            if route.token_command.is_none() {
                 continue;
-            };
-            let output = Command::new(&command[0])
-                .args(&command[1..])
-                .output()
-                .map_err(|error| format!("执行 token_command 失败（{}）: {error}", route.route))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "token_command 失败（{}）：{}",
-                    route.route,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
             }
-            let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if secret.is_empty() {
-                return Err(format!("token_command 没有输出凭据（{}）", route.route));
-            }
-            let credentials_dir = proxy_state_dir.join("credentials");
-            fs::create_dir_all(&credentials_dir).map_err(|error| error.to_string())?;
-            write_secret_file(&credentials_dir.join(&route.route), &secret)?;
+            let secret = run_token_command(route)?;
+            write_route_secret(&proxy_state_dir, route, &secret)?;
         }
         spec.credential_routes = routes
             .iter()
@@ -996,7 +987,10 @@ pub fn export_session_audit(
     session_id: &str,
     output: &Path,
 ) -> Result<(), String> {
-    let record = load_session_record(state_dir, session_id)?;
+    let mut record = load_session_record(state_dir, session_id)?;
+    // Chain the audit before exporting so the file carries a verifiable digest
+    // over its own contents.
+    record.chain_audit();
     let rendered = if output.extension().and_then(|value| value.to_str()) == Some("html") {
         audit_html(&record)?
     } else {
@@ -1210,6 +1204,105 @@ fn spec_from_command(command: &CliCommand) -> Result<SessionSpec, String> {
 }
 
 /// Parses a host:port entry from --allow-host into a session-scoped rule.
+/// Runs a route's host-side token command and returns the trimmed stdout.
+fn run_token_command(route: &CredentialRoute) -> Result<String, String> {
+    let command = route
+        .token_command
+        .as_ref()
+        .ok_or_else(|| format!("路由 {} 没有 token_command", route.route))?;
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .map_err(|error| format!("执行 token_command 失败（{}）: {error}", route.route))?;
+    if !output.status.success() {
+        return Err(format!(
+            "token_command 失败（{}）：{}",
+            route.route,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if secret.is_empty() {
+        return Err(format!("token_command 没有输出凭据（{}）", route.route));
+    }
+    Ok(secret)
+}
+
+fn write_route_secret(
+    proxy_state_dir: &Path,
+    route: &CredentialRoute,
+    secret: &str,
+) -> Result<(), String> {
+    let credentials_dir = proxy_state_dir.join("credentials");
+    fs::create_dir_all(&credentials_dir).map_err(|error| error.to_string())?;
+    write_secret_file(&credentials_dir.join(&route.route), secret)
+}
+
+/// Renews short-lived credentials while the agent runs. The thread stops when
+/// the session ends, so nothing is refreshed after the container is gone.
+struct CredentialRefresh {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CredentialRefresh {
+    fn stop(mut self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_credential_refresh(
+    routes: Vec<CredentialRoute>,
+    proxy_state_dir: PathBuf,
+) -> CredentialRefresh {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let Some(ttl) = routes
+        .iter()
+        .filter(|route| route.token_command.is_some())
+        .filter_map(|route| route.token_ttl_secs)
+        .min()
+    else {
+        return CredentialRefresh { stop, handle: None };
+    };
+    // Renew at half the lifetime so one slow refresh cannot let a token expire.
+    let interval = Duration::from_secs((ttl / 2).max(1));
+    let handle = thread::spawn(move || {
+        let mut last = Instant::now();
+        while !flag.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(200));
+            if last.elapsed() < interval {
+                continue;
+            }
+            last = Instant::now();
+            for route in &routes {
+                if route.token_command.is_none() {
+                    continue;
+                }
+                match run_token_command(route) {
+                    Ok(secret) => {
+                        if let Err(error) = write_route_secret(&proxy_state_dir, route, &secret) {
+                            eprintln!("凭据轮换写入失败（{}）: {error}", route.route);
+                        }
+                    }
+                    Err(error) => eprintln!("凭据轮换失败（{}）: {error}", route.route),
+                }
+            }
+        }
+    });
+    CredentialRefresh {
+        stop,
+        handle: Some(handle),
+    }
+}
+
 /// Writes a credential file only the owner can read. The host writes it; the
 /// agent container has no mount for the proxy state directory at all.
 #[cfg(unix)]

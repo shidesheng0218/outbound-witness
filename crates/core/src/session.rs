@@ -281,6 +281,11 @@ pub struct SessionRecord {
     pub pending_requests: Vec<ApprovalRequest>,
     pub network_intents: Vec<NetworkIntent>,
     pub audit: Vec<SessionAuditRecord>,
+    /// SHA-256 chain over `audit`, one hash per record, recomputed before an
+    /// export. A third party can re-derive it with the verify command without
+    /// trusting the process that produced the file.
+    #[serde(default)]
+    pub audit_chain: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -296,8 +301,49 @@ impl SessionRecord {
             pending_requests: Vec::new(),
             network_intents: Vec::new(),
             audit: Vec::new(),
+            audit_chain: Vec::new(),
             error: None,
         }
+    }
+
+    /// Recomputes the audit hash chain. Each link covers the record and the
+    /// previous link, so editing, reordering, or dropping a record breaks it.
+    pub fn chain_audit(&mut self) {
+        let mut previous: Option<String> = None;
+        let mut chain = Vec::with_capacity(self.audit.len());
+        for record in &self.audit {
+            let material =
+                serde_json::to_vec(&(record, &previous)).expect("audit records must serialize");
+            let hash = crate::sha256_hex(&material);
+            previous = Some(hash.clone());
+            chain.push(hash);
+        }
+        self.audit_chain = chain;
+    }
+
+    /// Re-derives the chain and reports the first record that does not match.
+    pub fn verify_audit_chain(&self) -> Result<(), (usize, String)> {
+        if self.audit_chain.len() != self.audit.len() {
+            return Err((
+                0,
+                format!(
+                    "审计链长度 {} 与记录数 {} 不一致",
+                    self.audit_chain.len(),
+                    self.audit.len()
+                ),
+            ));
+        }
+        let mut previous: Option<String> = None;
+        for (index, record) in self.audit.iter().enumerate() {
+            let material =
+                serde_json::to_vec(&(record, &previous)).expect("audit records must serialize");
+            let expected = crate::sha256_hex(&material);
+            if self.audit_chain[index] != expected {
+                return Err((index, "chain_hash 与记录内容不匹配".to_string()));
+            }
+            previous = Some(expected);
+        }
+        Ok(())
     }
 }
 

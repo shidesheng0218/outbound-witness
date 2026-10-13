@@ -11,13 +11,14 @@
 //! process is a new trust boundary, because it holds usable credentials.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::write_json;
 
@@ -59,8 +60,45 @@ pub struct CredentialRoute {
     /// for `secret_file`, e.g. a cloud CLI printing a short-lived token.
     #[serde(default)]
     pub token_command: Option<Vec<String>>,
+    /// How long a credential produced by `token_command` stays valid. When set,
+    /// the CLI re-runs the command at half this interval while the session runs.
+    #[serde(default)]
+    pub token_ttl_secs: Option<u64>,
+    /// Refuse more than this many brokered requests per minute for this route,
+    /// so a compromised agent cannot use the credential as a free API budget.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u32>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// Sliding one-minute window of request times per route.
+static RATE_WINDOWS: OnceLock<Mutex<HashMap<String, VecDeque<Instant>>>> = OnceLock::new();
+
+/// Records a request and reports whether the route is still within its budget.
+/// Routes without a limit always pass.
+fn rate_limit_allows(route: &CredentialRoute, now: Instant) -> bool {
+    let Some(limit) = route.max_requests_per_minute else {
+        return true;
+    };
+    if limit == 0 {
+        return false;
+    }
+    let windows = RATE_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut windows = windows.lock().unwrap_or_else(|error| error.into_inner());
+    let window = windows.entry(route.route.clone()).or_default();
+    while let Some(oldest) = window.front() {
+        if now.duration_since(*oldest) >= Duration::from_secs(60) {
+            window.pop_front();
+        } else {
+            break;
+        }
+    }
+    if window.len() as u32 >= limit {
+        return false;
+    }
+    window.push_back(now);
+    true
 }
 
 fn default_upstream_port() -> u16 {
@@ -125,6 +163,12 @@ impl CredentialRoute {
             if file_path.is_none() {
                 return Err("token_command 只能配合 secret_file 使用".to_string());
             }
+        }
+        if self.token_ttl_secs.is_some() && self.token_command.is_none() {
+            return Err("token_ttl_secs 只能配合 token_command 使用".to_string());
+        }
+        if self.token_ttl_secs == Some(0) {
+            return Err("token_ttl_secs 必须大于 0".to_string());
         }
         Ok(())
     }
@@ -474,6 +518,15 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
         );
         return Ok(());
     };
+    if !rate_limit_allows(route, Instant::now()) {
+        eprintln!("broker rate limit hit for route {}", route.route);
+        write_error(
+            &mut client,
+            "429 Too Many Requests",
+            &format!("路由 {} 超过每分钟请求上限", route.route),
+        );
+        return Ok(());
+    }
     let secret = match resolve_secret(state_dir, route) {
         Ok(secret) => secret,
         Err(error) => {
@@ -554,6 +607,8 @@ mod tests {
             secret_env: Some("ANTHROPIC_API_KEY".into()),
             secret_file: None,
             token_command: None,
+            token_ttl_secs: None,
+            max_requests_per_minute: None,
             note: None,
         }
     }
@@ -690,6 +745,48 @@ mod tests {
         assert!(resolve_secret(&dir, &env_route).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_ttl_requires_a_token_command_and_must_be_positive() {
+        let mut orphan = route();
+        orphan.token_ttl_secs = Some(60);
+        assert!(orphan.validate().is_err(), "ttl without a command is meaningless");
+
+        let mut zero = route();
+        zero.secret_env = None;
+        zero.secret_file = Some("credentials/x".into());
+        zero.token_command = Some(vec!["echo".into()]);
+        zero.token_ttl_secs = Some(0);
+        assert!(zero.validate().is_err(), "a zero ttl would renew forever");
+    }
+
+    #[test]
+    fn rate_limit_allows_up_to_the_budget_within_one_minute() {
+        let mut limited = route();
+        limited.route = "ratelimit-budget-test".into();
+        limited.max_requests_per_minute = Some(2);
+        let now = Instant::now();
+        assert!(rate_limit_allows(&limited, now));
+        assert!(rate_limit_allows(&limited, now));
+        assert!(
+            !rate_limit_allows(&limited, now),
+            "the third request inside the window must be refused"
+        );
+        assert!(
+            rate_limit_allows(&limited, now + Duration::from_secs(61)),
+            "a request after the window frees a slot"
+        );
+    }
+
+    #[test]
+    fn routes_without_a_limit_always_pass() {
+        let mut unlimited = route();
+        unlimited.route = "ratelimit-unlimited-test".into();
+        let now = Instant::now();
+        for _ in 0..100 {
+            assert!(rate_limit_allows(&unlimited, now));
+        }
     }
 
     #[test]
