@@ -1,6 +1,6 @@
 use outbound_witness_core::{
-    evaluate_event, AuditLedger, ConsentGrant, Destination, EnforcementMode, FileEvent, FileEventKind,
-    NetworkEvent, PolicyDecision, ProcessIdentity, RuleConfig, WitnessEvent,
+    evaluate_event, AuditLedger, ConsentGrant, Destination, EnforcementMode, FileEvent,
+    FileEventKind, NetworkEvent, PolicyDecision, ProcessIdentity, RuleConfig, WitnessEvent,
 };
 
 fn process() -> ProcessIdentity {
@@ -137,7 +137,9 @@ fn compute_executable_sha256_hashes_file_contents_and_fails_closed_on_missing_fi
     let temp = std::env::temp_dir().join(format!("ow-binary-{}", std::process::id()));
     std::fs::write(&temp, b"fake-binary-contents").unwrap();
     identity.executable = temp.to_string_lossy().into_owned();
-    let hash = identity.compute_executable_sha256().expect("hash should compute");
+    let hash = identity
+        .compute_executable_sha256()
+        .expect("hash should compute");
     assert_eq!(
         hash,
         outbound_witness_core::sha256_hex(b"fake-binary-contents"),
@@ -203,6 +205,44 @@ fn process_version_change_invalidates_existing_consent() {
 }
 
 #[test]
+fn benchmark_fixtures_match_their_expected_decisions() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in [
+        "benign-git-push.json",
+        "sensitive-batch-upload.json",
+        "archive-upload-with-consent.json",
+    ] {
+        let source =
+            std::fs::read_to_string(root.join("fixtures").join(file)).expect("fixture should read");
+        let document: serde_json::Value =
+            serde_json::from_str(&source).expect("fixture should parse");
+        let mut event: WitnessEvent =
+            serde_json::from_value(document["event"].clone()).expect("event should parse");
+        if !std::path::Path::new(&event.process.executable).is_absolute() {
+            event.process.executable = root
+                .join(&event.process.executable)
+                .to_string_lossy()
+                .into_owned();
+        }
+        event.resolve_executable_sha256();
+        for (mode, key) in [
+            (EnforcementMode::Observe, "observe"),
+            (EnforcementMode::Strict, "strict"),
+        ] {
+            let Some(expected) = document["expected"][key].as_str() else {
+                continue;
+            };
+            let result = evaluate_event(&event, &RuleConfig::default(), mode);
+            assert_eq!(
+                format!("{:?}", result.decision),
+                expected,
+                "{file} {key} decision mismatch"
+            );
+        }
+    }
+}
+
+#[test]
 fn audit_ledger_exports_events_without_file_contents_and_with_chain_hashes() {
     let mut ledger = AuditLedger::new();
     let result = evaluate_event(
@@ -218,6 +258,47 @@ fn audit_ledger_exports_events_without_file_contents_and_with_chain_hashes() {
     assert!(json.contains("abc123"));
     assert!(!json.contains("file_contents"));
     assert!(json.contains("chain_hash"));
+}
+
+#[test]
+fn audit_ledger_chain_verification_detects_tampering() {
+    let mut ledger = AuditLedger::new();
+    let result = evaluate_event(
+        &upload_event(),
+        &RuleConfig::default(),
+        EnforcementMode::Observe,
+    );
+    ledger.append(&upload_event(), &result);
+    ledger.verify_chain().expect("fresh ledger must verify");
+
+    ledger.records[0].evaluation.risk_score = 0;
+    assert!(
+        ledger.verify_chain().is_err(),
+        "editing a record after append must break the chain"
+    );
+}
+
+#[test]
+fn consent_accepts_fractional_seconds_and_timezone_offsets() {
+    let mut event = upload_event();
+    event.file_events.clear();
+    event.archive_created = false;
+    event.first_seen_destination = false;
+    event.consent = Some(ConsentGrant {
+        executable_sha256: "demo-binary-content-hash".into(),
+        process_version: "1.2.3".into(),
+        destination_host: "upload.example.test".into(),
+        destination_port: Some(443),
+        path_prefix: "/workspace".into(),
+        expires_at: Some("2026-09-23T17:00:00.500+08:00".into()),
+        scope: "session".into(),
+    });
+    let result = evaluate_event(&event, &RuleConfig::default(), EnforcementMode::Strict);
+    assert!(result.consent_applied);
+
+    event.consent.as_mut().unwrap().expires_at = Some("2026-09-21T09:00:00+08:00".into());
+    let expired = evaluate_event(&event, &RuleConfig::default(), EnforcementMode::Strict);
+    assert!(!expired.consent_applied);
 }
 
 #[test]

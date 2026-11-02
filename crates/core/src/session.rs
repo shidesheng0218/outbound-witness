@@ -54,21 +54,21 @@ pub struct SessionSpec {
     /// Content-addressed digest of `image` attested at session start (the
     /// `docker image inspect .Id`). Approval grants bind to it so a grant
     /// issued for one session image cannot be replayed against another.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_id: Option<String>,
     /// Hosts pre-authorized at session start, each written as host:port. They
     /// are seeded into the session proxy state so the proxy can allow matching
     /// CONNECT requests without pausing for a human.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_authorized_hosts: Vec<String>,
     /// Credential broker routes for this session. Secret values live only in the
     /// proxy container environment; these summaries let the runtime pass the
     /// right variables to the right container and let the audit show which
     /// credentials a session could reach.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_routes: Vec<CredentialRouteSummary>,
     /// Host-side JSON file the routes were read from, kept for provenance.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_routes_path: Option<String>,
     pub state_dir: PathBuf,
 }
@@ -155,11 +155,11 @@ pub struct CredentialRouteSummary {
     pub upstream_host: String,
     pub upstream_port: u16,
     /// Name of the proxy-side environment variable, when the route uses one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_env: Option<String>,
     /// Proxy-state-relative path to a host-written secret file, when the route
     /// uses one. A short-lived token produced by token_command lands here.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_file: Option<String>,
 }
 
@@ -256,7 +256,7 @@ pub struct SessionAuditRecord {
     pub runtime_digest: String,
     pub policy_version: String,
     /// Image digest the approval grants of this record bind to.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_id: Option<String>,
     pub approval_request: Option<ApprovalRequest>,
     pub approval_response: Option<ApprovalResponse>,
@@ -266,7 +266,7 @@ pub struct SessionAuditRecord {
     pub evaluation: Option<EvaluationResult>,
     /// Proxy request id when this record was built from a CONNECT. Used to
     /// replace the same witness on a later collection instead of appending.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_request_id: Option<String>,
 }
 
@@ -279,6 +279,16 @@ pub struct AuditSignature {
     /// because anyone can mint a key pair and sign a fabricated record.
     pub public_key: String,
     pub value: String,
+}
+
+/// Commitment to the complete audit chain. A hash chain alone cannot detect
+/// trailing truncation: dropping the last records (and their hashes) leaves a
+/// perfectly valid prefix. The seal records how many records were present and
+/// the final root at signing time, so a verifier can reject a shortened export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditSeal {
+    pub record_count: usize,
+    pub root_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -301,6 +311,11 @@ pub struct SessionRecord {
     /// was not altered; the signature is what can prove who produced it.
     #[serde(default)]
     pub signature: Option<AuditSignature>,
+    /// Record count and root hash at signing time. Optional so records written
+    /// before seals existed still deserialize; verification treats a missing
+    /// seal as "completeness cannot be proven" rather than as valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_seal: Option<AuditSeal>,
     pub error: Option<String>,
 }
 
@@ -318,6 +333,7 @@ impl SessionRecord {
             audit: Vec::new(),
             audit_chain: Vec::new(),
             signature: None,
+            audit_seal: None,
             error: None,
         }
     }
@@ -335,9 +351,15 @@ impl SessionRecord {
             chain.push(hash);
         }
         self.audit_chain = chain;
+        self.audit_seal = Some(AuditSeal {
+            record_count: self.audit.len(),
+            root_hash: self.audit_chain.last().cloned(),
+        });
     }
 
     /// Re-derives the chain and reports the first record that does not match.
+    /// When an `audit_seal` is present its record count and root hash are
+    /// checked too, which is what makes trailing truncation detectable.
     pub fn verify_audit_chain(&self) -> Result<(), (usize, String)> {
         if self.audit_chain.len() != self.audit.len() {
             return Err((
@@ -358,6 +380,21 @@ impl SessionRecord {
                 return Err((index, "chain_hash 与记录内容不匹配".to_string()));
             }
             previous = Some(expected);
+        }
+        if let Some(seal) = &self.audit_seal {
+            if seal.record_count != self.audit.len() {
+                return Err((
+                    0,
+                    format!(
+                        "完整性封条记录数 {} 与当前记录数 {} 不一致（可能被截断）",
+                        seal.record_count,
+                        self.audit.len()
+                    ),
+                ));
+            }
+            if seal.root_hash.as_ref() != self.audit_chain.last() {
+                return Err((0, "完整性封条根哈希与审计链末尾不一致".to_string()));
+            }
         }
         Ok(())
     }

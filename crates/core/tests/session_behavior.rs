@@ -44,7 +44,10 @@ fn strict_network_policy_only_allows_explicit_hosts() {
 fn approval_request_times_out_to_block_and_allow_response_overrides_timeout() {
     let pending = ApprovalRequest::new("req-1".into(), "upload.example.test".into(), 1_000);
     assert_eq!(pending.timeout_ms, 120_000);
-    assert_eq!(approval_decision(&pending, 11_001), SessionDecision::Pending);
+    assert_eq!(
+        approval_decision(&pending, 11_001),
+        SessionDecision::Pending
+    );
     assert_eq!(approval_decision(&pending, 121_001), SessionDecision::Block);
 
     let allowed = ApprovalRequest {
@@ -134,7 +137,10 @@ fn apply_refuses_when_selected_path_traverses_symlink() {
 
     let error = apply_diff(&source, &snapshot, &diff, &["sub/file.txt".into()])
         .expect_err("writeback must refuse to follow a symlinked parent");
-    assert!(error.contains("符号链接"), "unexpected error message: {error}");
+    assert!(
+        error.contains("符号链接"),
+        "unexpected error message: {error}"
+    );
     assert!(
         !outside.join("file.txt").exists(),
         "nothing may be written through the symlink"

@@ -3,13 +3,84 @@ pub mod broker;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Hard ceiling on concurrent proxy/broker connections. The agent is
+/// untrusted; without this it can exhaust proxy threads and host memory by
+/// opening connections and never finishing the request.
+const MAX_CONNECTIONS: usize = 256;
+/// Hard ceiling on request records written for one session. Request files are
+/// evidence, so they are not deleted while the session lives; the cap keeps a
+/// hostile agent from filling the disk.
+const MAX_REQUEST_FILES: usize = 5_000;
+/// Upper bound on reading a request or response header block, and on the
+/// whole header read (not just each individual read).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PROXY_HEADER_BYTES: usize = 16 * 1024;
+
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static REQUEST_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard for one proxy connection slot. Dropping it always releases the
+/// slot, including on error paths.
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    fn acquire() -> Option<Self> {
+        loop {
+            let current = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+            if current >= MAX_CONNECTIONS {
+                return None;
+            }
+            if ACTIVE_CONNECTIONS
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self);
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reserves a slot for one new request file. Returns false once the session's
+/// evidence budget is exhausted.
+fn reserve_request_file() -> bool {
+    let current = REQUEST_FILES.fetch_add(1, Ordering::Relaxed);
+    if current >= MAX_REQUEST_FILES {
+        REQUEST_FILES.fetch_sub(1, Ordering::Relaxed);
+        false
+    } else {
+        true
+    }
+}
+
+/// Seeds the request-file counter from records already present on disk. Called
+/// once when the proxy starts so a restart cannot bypass the budget.
+pub fn seed_request_file_count(state_dir: &Path) {
+    let count = fs::read_dir(state_dir.join("requests"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    REQUEST_FILES.store(count, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -95,6 +166,12 @@ pub enum DecisionSource {
     Denied,
     Timeout,
     Pending,
+    /// The target hostname resolved only to non-public addresses (loopback,
+    /// private, link-local, metadata, and similar), so the proxy refused it
+    /// after policy allowed the CONNECT.
+    BlockedTarget,
+    /// Policy allowed the request but the upstream TCP connection failed.
+    ConnectFailed,
 }
 
 impl DecisionSource {
@@ -106,6 +183,8 @@ impl DecisionSource {
             DecisionSource::Denied => "denied",
             DecisionSource::Timeout => "timeout",
             DecisionSource::Pending => "pending",
+            DecisionSource::BlockedTarget => "blocked_target",
+            DecisionSource::ConnectFailed => "connect_failed",
         }
     }
 }
@@ -149,7 +228,8 @@ pub fn next_request_id(now_ms: u64) -> String {
     format!("req-{now_ms}-{}-{counter}-{nanos}", std::process::id())
 }
 
-pub fn parse_connect_target(line: &str) -> Result<(String, u16), String> {    let mut parts = line.split_whitespace();
+pub fn parse_connect_target(line: &str) -> Result<(String, u16), String> {
+    let mut parts = line.split_whitespace();
     let method = parts
         .next()
         .ok_or_else(|| "empty proxy request".to_string())?;
@@ -222,9 +302,10 @@ pub fn evaluate_request_detailed(
             source: DecisionSource::PreAuthorized,
         };
     }
-    if approvals.iter().any(|grant| {
-        grant_applies_with_binding(grant, request, now_ms, config.image_id.as_deref())
-    }) {
+    if approvals
+        .iter()
+        .any(|grant| grant_applies_with_binding(grant, request, now_ms, config.image_id.as_deref()))
+    {
         return RequestEvaluation {
             decision: ProxyDecision::Allow,
             source: DecisionSource::ManualApproval,
@@ -329,8 +410,16 @@ pub fn run_from_env() -> Result<(), String> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(120_000);
-    let image_id = std::env::var("OW_PROXY_IMAGE_ID").ok().filter(|value| !value.is_empty());
+    let image_id = std::env::var("OW_PROXY_IMAGE_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
     fs::create_dir_all(state_dir.join("requests")).map_err(|error| error.to_string())?;
+    seed_request_file_count(&state_dir);
+    // SSRF protection is on by default. Operators who genuinely need an
+    // internal upstream can opt out explicitly for this proxy container.
+    let allow_private = std::env::var("OW_PROXY_ALLOW_PRIVATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     let config = ProxyConfig {
         mode,
@@ -352,7 +441,7 @@ pub fn run_from_env() -> Result<(), String> {
         let config = config.clone();
         let state_dir = state_dir.clone();
         thread::spawn(move || {
-            if let Err(error) = handle_client(client, &state_dir, &config) {
+            if let Err(error) = handle_client(client, &state_dir, &config, allow_private) {
                 eprintln!("proxy connection failed: {error}");
             }
         });
@@ -360,12 +449,113 @@ pub fn run_from_env() -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses loopback, private, link-local, CGNAT, documentation, multicast, and
+/// metadata-style addresses. The proxy itself makes the outbound connection, so
+/// without this an approved hostname could resolve to the cloud metadata
+/// endpoint or another service only the proxy can reach.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let segments = v6.segments();
+            let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || documentation)
+        }
+    }
+}
+
+/// Resolves the CONNECT target and removes every non-public address. The proxy
+/// connects to the returned addresses, not to the hostname again, so a DNS
+/// answer cannot change between policy approval and connection setup.
+fn resolve_target_addrs(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, String> {
+    let resolved = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("解析目标 {host}:{port} 失败: {error}"))?;
+    let addresses = resolved
+        .filter(|address| allow_private || is_public_ip(address.ip()))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!(
+            "目标 {host}:{port} 只解析到非公网地址，已按 SSRF 防护拒绝"
+        ));
+    }
+    Ok(addresses)
+}
+
+fn connect_any(addresses: &[SocketAddr]) -> Result<TcpStream, String> {
+    let mut last_error = String::from("没有可用地址");
+    for address in addresses {
+        match TcpStream::connect(address) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = format!("{address}: {error}"),
+        }
+    }
+    Err(format!("连接目标失败: {last_error}"))
+}
+
+fn write_status(stream: &mut TcpStream, status: &str) {
+    let _ = stream.write_all(
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    let _ = stream.flush();
+}
+
+fn record_decision(
+    path: &Path,
+    request: &ProxyRequest,
+    source: DecisionSource,
+) -> Result<(), String> {
+    write_json(
+        path,
+        &ProxyRequest {
+            decision_source: Some(source.as_str().to_string()),
+            ..request.clone()
+        },
+    )
+}
+
 fn handle_client(
     mut client: TcpStream,
     state_dir: &Path,
     config: &ProxyConfig,
+    allow_private: bool,
 ) -> Result<(), String> {
+    let Some(_guard) = ConnectionGuard::acquire() else {
+        write_status(&mut client, "503 Service Unavailable");
+        return Ok(());
+    };
+    let _ = client.set_read_timeout(Some(HEADER_READ_TIMEOUT));
+    let _ = client.set_write_timeout(Some(HEADER_READ_TIMEOUT));
     let header = read_headers(&mut client)?;
+    // The tunnel itself may be long-lived; only the header exchange is
+    // bounded.
+    let _ = client.set_read_timeout(None);
+    let _ = client.set_write_timeout(None);
     let first_line = header
         .lines()
         .next()
@@ -379,6 +569,10 @@ fn handle_client(
         bytes_sent: 0,
         decision_source: None,
     };
+    if !reserve_request_file() {
+        write_status(&mut client, "429 Too Many Requests");
+        return Ok(());
+    }
     let request_path = state_dir
         .join("requests")
         .join(format!("{}.json", request.request_id));
@@ -402,27 +596,36 @@ fn handle_client(
                 allowed_by = evaluation.source;
                 // Persist the reason immediately so the session request list
                 // can show why a connection was let through before it ends.
-                write_json(
-                    &request_path,
-                    &ProxyRequest {
-                        decision_source: Some(allowed_by.as_str().to_string()),
-                        ..request.clone()
-                    },
-                )?;
+                record_decision(&request_path, &request, allowed_by)?;
                 break;
             }
             ProxyDecision::Block => {
-                client
-                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                    .map_err(|error| error.to_string())?;
+                let _ = record_decision(&request_path, &request, evaluation.source);
+                write_status(&mut client, "403 Forbidden");
                 return Ok(());
             }
             ProxyDecision::Pending => thread::sleep(Duration::from_millis(100)),
         }
     }
 
-    let mut upstream = TcpStream::connect((request.host.as_str(), request.port))
-        .map_err(|error| format!("connect {}:{}: {error}", request.host, request.port))?;
+    let targets = match resolve_target_addrs(&request.host, request.port, allow_private) {
+        Ok(targets) => targets,
+        Err(error) => {
+            eprintln!("{error}");
+            let _ = record_decision(&request_path, &request, DecisionSource::BlockedTarget);
+            write_status(&mut client, "403 Forbidden");
+            return Ok(());
+        }
+    };
+    let mut upstream = match connect_any(&targets) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("{error}");
+            let _ = record_decision(&request_path, &request, DecisionSource::ConnectFailed);
+            write_status(&mut client, "502 Bad Gateway");
+            return Ok(());
+        }
+    };
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .map_err(|error| error.to_string())?;
@@ -448,9 +651,13 @@ fn handle_client(
 }
 
 fn read_headers(stream: &mut TcpStream) -> Result<String, String> {
+    let started = Instant::now();
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
-    while bytes.len() < 16 * 1024 {
+    while bytes.len() < MAX_PROXY_HEADER_BYTES {
+        if started.elapsed() > HEADER_READ_TIMEOUT {
+            return Err("读取请求头超时".to_string());
+        }
         let count = stream
             .read(&mut buffer)
             .map_err(|error| error.to_string())?;
@@ -509,4 +716,47 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("test address should parse")
+    }
+
+    #[test]
+    fn blocks_non_public_target_addresses() {
+        for value in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!is_public_ip(ip(value)), "{value} must be refused");
+        }
+        for value in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(is_public_ip(ip(value)), "{value} must be allowed");
+        }
+    }
+
+    #[test]
+    fn connection_guard_releases_its_slot() {
+        let before = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        let guard = ConnectionGuard::acquire().expect("a slot should be available");
+        assert_eq!(ACTIVE_CONNECTIONS.load(Ordering::Relaxed), before + 1);
+        drop(guard);
+        assert_eq!(ACTIVE_CONNECTIONS.load(Ordering::Relaxed), before);
+    }
 }

@@ -248,8 +248,8 @@ fn collect_files(
 }
 
 fn file_metadata(root: &Path, path: &Path) -> Result<WorkspaceFile, String> {
-    let content = fs::read(path).map_err(|error| error.to_string())?;
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let sha256 = crate::sha256_file(path).map_err(|error| error.to_string())?;
     Ok(WorkspaceFile {
         relative_path: path
             .strip_prefix(root)
@@ -257,7 +257,7 @@ fn file_metadata(root: &Path, path: &Path) -> Result<WorkspaceFile, String> {
             .to_string_lossy()
             .replace('\\', "/"),
         size: metadata.len(),
-        sha256: sha256_hex(&content),
+        sha256,
     })
 }
 
@@ -301,8 +301,8 @@ fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<(), Stri
 /// taken would otherwise be silently overwritten by `apply`.
 fn verify_host_unchanged(source: &Path, relative: &Path, entry: &DiffEntry) -> Result<(), String> {
     let target = source.join(relative);
-    let current = match fs::read(&target) {
-        Ok(bytes) => Some(sha256_hex(&bytes)),
+    let current = match crate::sha256_file(&target) {
+        Ok(hash) => Some(hash),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("无法读取宿主文件 {}: {error}", target.display())),
     };

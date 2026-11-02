@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 pub mod platform;
 pub mod session;
@@ -39,7 +42,7 @@ pub struct ProcessIdentity {
     /// as "no match" and fails closed rather than degrading to a path-based
     /// comparison. See `compute_executable_sha256` and
     /// `WitnessEvent::resolve_executable_sha256`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_sha256: Option<String>,
 }
 
@@ -48,7 +51,7 @@ impl ProcessIdentity {
     /// when the file cannot be read, so callers never fall back to a weaker
     /// path-string comparison by accident.
     pub fn compute_executable_sha256(&self) -> Option<String> {
-        std::fs::read(&self.executable).ok().map(|bytes| sha256_hex(&bytes))
+        sha256_file(Path::new(&self.executable)).ok()
     }
 }
 
@@ -86,7 +89,7 @@ pub struct ConsentGrant {
     /// behaviour (any port on `destination_host`). Every grant produced by
     /// the CLI now carries the port of the approved request, so approving a
     /// host can no longer silently authorise every port on it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_port: Option<u16>,
     pub path_prefix: String,
     pub expires_at: Option<String>,
@@ -204,26 +207,90 @@ pub struct EvaluationResult {
     pub consent_applied: bool,
 }
 
-
 fn parse_rfc3339_millis(value: &str) -> Result<i64, ()> {
-    let value = value.strip_suffix('Z').ok_or(())?;
-    let (date, time) = value.split_once('T').ok_or(())?;
+    let value = value.trim();
+    let (datetime, offset_seconds) = split_offset(value)?;
+    let (date, time) = datetime.split_once('T').ok_or(())?;
     let mut dates = date.split('-');
     let year: i64 = dates.next().ok_or(())?.parse().map_err(|_| ())?;
     let month: u32 = dates.next().ok_or(())?.parse().map_err(|_| ())?;
     let day: u32 = dates.next().ok_or(())?.parse().map_err(|_| ())?;
-    if dates.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if dates.next().is_some()
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
         return Err(());
     }
     let mut times = time.split(':');
     let hour: u32 = times.next().ok_or(())?.parse().map_err(|_| ())?;
     let minute: u32 = times.next().ok_or(())?.parse().map_err(|_| ())?;
-    let second: u32 = times.next().ok_or(())?.parse().map_err(|_| ())?;
-    if times.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+    let second_field = times.next().ok_or(())?;
+    if times.next().is_some() {
+        return Err(());
+    }
+    let (second_text, fraction) = match second_field.split_once('.') {
+        Some((second, fraction)) => (second, Some(fraction)),
+        None => (second_field, None),
+    };
+    let second: u32 = second_text.parse().map_err(|_| ())?;
+    if let Some(fraction) = fraction {
+        if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(());
+        }
+    }
+    if hour > 23 || minute > 59 || second > 60 {
         return Err(());
     }
     let days = days_from_civil(year, month, day)?;
-    Ok(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+    Ok(
+        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second)
+            - offset_seconds,
+    )
+}
+
+/// Splits an RFC3339 timestamp into its local date/time part and the UTC offset
+/// in seconds. Fractional seconds are handled by the caller; offsets accept
+/// `Z`, `+08:00`, `-05:00`, and the compact `+0800` form.
+fn split_offset(value: &str) -> Result<(&str, i64), ()> {
+    if let Some(value) = value.strip_suffix('Z').or_else(|| value.strip_suffix('z')) {
+        return Ok((value, 0));
+    }
+    let time_start = value.find('T').ok_or(())? + 1;
+    let offset_index = value[time_start..].rfind(['+', '-']).ok_or(())?;
+    let (datetime, offset) = value.split_at(time_start + offset_index);
+    let sign = if offset.starts_with('-') { -1 } else { 1 };
+    let offset = &offset[1..];
+    let (hour, minute) = if let Some((hour, minute)) = offset.split_once(':') {
+        (hour, minute)
+    } else if offset.len() == 4 {
+        (&offset[..2], &offset[2..])
+    } else {
+        return Err(());
+    };
+    if hour.len() != 2
+        || minute.len() != 2
+        || !hour.bytes().all(|byte| byte.is_ascii_digit())
+        || !minute.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+    let hour: u32 = hour.parse().map_err(|_| ())?;
+    let minute: u32 = minute.parse().map_err(|_| ())?;
+    if hour > 23 || minute > 59 {
+        return Err(());
+    }
+    Ok((datetime, sign * i64::from(hour * 3_600 + minute * 60)))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Result<i64, ()> {
@@ -367,6 +434,27 @@ impl AuditLedger {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+
+    /// Re-derives the ledger chain without trusting the process that produced
+    /// it. A changed, reordered, or removed middle record breaks the chain;
+    /// trailing truncation still needs a trusted signature or external anchor,
+    /// exactly like the session ledger.
+    pub fn verify_chain(&self) -> Result<(), (usize, String)> {
+        let mut previous: Option<String> = None;
+        for (index, record) in self.records.iter().enumerate() {
+            if record.previous_chain_hash.as_ref() != previous.as_ref() {
+                return Err((index, "previous_chain_hash 与上一条记录不匹配".to_string()));
+            }
+            let material = serde_json::to_vec(&(&record.event, &record.evaluation, &previous))
+                .expect("audit records must serialize");
+            let expected = sha256_hex(&material);
+            if record.chain_hash != expected {
+                return Err((index, "chain_hash 与记录内容不匹配".to_string()));
+            }
+            previous = Some(expected);
+        }
+        Ok(())
+    }
 }
 
 fn is_sensitive_path(path: &str, config: &RuleConfig) -> bool {
@@ -386,4 +474,52 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Hashes a file without loading it into memory, so snapshotting a large
+/// workspace cannot exhaust the host just to compute a diff.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rfc3339_millis;
+
+    #[test]
+    fn parses_fractional_seconds_and_timezone_offsets() {
+        let base = parse_rfc3339_millis("2026-09-22T09:00:00Z").expect("base timestamp");
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-22T09:00:00.123Z").expect("fractional timestamp"),
+            base
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-22T17:00:00+08:00").expect("offset timestamp"),
+            base
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-22T04:00:00-05:00").expect("negative offset"),
+            base
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-22T17:00:00+0800").expect("compact offset"),
+            base
+        );
+        assert!(parse_rfc3339_millis("2026-09-22T09:00:00").is_err());
+        assert!(parse_rfc3339_millis("2026-09-22T09:00:00+08").is_err());
+        assert!(parse_rfc3339_millis("2026-09-22T09:00:00.abcZ").is_err());
+        assert!(parse_rfc3339_millis("2026-02-31T09:00:00Z").is_err());
+        assert!(parse_rfc3339_millis("2026-02-29T09:00:00Z").is_err());
+        assert!(parse_rfc3339_millis("2024-02-29T09:00:00Z").is_ok());
+    }
 }

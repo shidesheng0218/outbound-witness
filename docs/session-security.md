@@ -10,8 +10,11 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 - Agent 通过 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY` 使用本地 egress proxy。
 - Proxy 只处理 HTTPS CONNECT 元数据，不解密 TLS 内容。
 - 严格模式未知请求会写入 Session 的 `proxy-state/requests/`；默认 120 秒没有授权时返回 HTTP 403。拒绝依据是没有匹配的批准，不是文件风险分。
-- `outbound-witness session approve` 写入的授权绑定 Session 启动时取证的 agent 镜像内容摘要（`docker image inspect .Id`）与请求的目标端口。`once` 只覆盖这一次请求；`host` 覆盖该主机与端口并遵守 `--ttl`；`session` 覆盖该主机与端口直到会话结束，忽略 TTL。代理只放行镜像摘要与端口都一致的授权；旧版缺少端口字段的授权文件按任意端口兼容。
+- `outbound-witness session approve` 写入的授权绑定 Session 启动时取证的 agent 镜像内容摘要（`docker image inspect .Id`）与请求的目标端口。`once` 只覆盖这一次请求；`host` 覆盖该主机与端口并遵守 `--ttl`（不填则持续到会话结束）；`session` 覆盖该主机与端口直到会话结束，忽略 TTL。代理只放行镜像摘要与端口都一致的授权；旧版缺少端口字段的授权文件按任意端口兼容。Session 按该摘要启动容器，而不是按可变 tag。
 - 预授权策略（`--allow-host` 或 `session preauth add`）命中的 CONNECT 直接放行，不再等待人工审批。规则始终绑定主机与端口，可设 TTL，仅存活于该 Session 的代理状态目录。审计会明确标注"来自预授权策略（自动放行，未经人工逐条批准）"，与"来自人工批准"分开记录。
+- 代理默认拒绝解析到环回、私网、链路本地、CGNAT、文档地址或云元数据地址的目标，并直接连接已解析的 IP。设置 `OW_PROXY_ALLOW_PRIVATE=1` 会关闭这一防护，只应在确实需要内网上游时使用。
+- 代理每个 Session 最多 256 个并发连接、5000 条请求记录，请求头和请求体读取都有超时；超出上限返回 503/429。proxy 容器以状态目录属主身份运行（Unix），并启用 `--cap-drop ALL`、`no-new-privileges`、只读根文件系统、pids/memory 限制。
+- agent 容器设置 `--dns 127.0.0.1`，尽量避免外部 DNS 解析成为绕过代理的旁路。是否完全阻断取决于 Docker 内嵌 DNS 的实现，部署时应结合实际 runtime 验证；需要外部解析时用 `OW_AGENT_DNS=<server>` 覆盖，`OW_AGENT_DNS=none` 恢复 Docker 默认。
 - 宿主工作区保持不变，直到用户执行 `outbound-witness session apply <id> --path <relative-path>`。写回前会核对宿主文件是否仍等于 diff 记录的 `before_sha256`，并拒绝父级包含符号链接的路径；任一冲突都会中止整次写回。
 
 ## 凭据外置（可选）
@@ -20,7 +23,7 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 
 - agent 容器只被注入 `OW_BROKER_<ROUTE>_BASE_URL=http://proxy:8080/<route>`，不含任何密钥；
 - 代理按路由声明的来源解析密钥：`secret_env`（代理容器环境变量）或 `secret_file`（代理状态目录内的文件，宿主机写入、权限 0600，agent 容器完全没有该目录的挂载）。二者必须且只能声明一个；
-- 短期凭据：路由可声明 `token_command`（例如云 CLI 打印临时 token），CLI 在**宿主机**执行它，把输出写入 `secret_file`。若同时声明 `token_ttl_secs`，会话运行期间会按该值的一半自动重新执行并覆盖文件，因此长会话不会用到过期 token。密钥始终不进入 agent 容器；
+- 短期凭据：路由可声明 `token_command`（例如云 CLI 打印临时 token），CLI 在**宿主机**执行它，把输出写入路由声明的 `secret_file`。命令有 60 秒超时，超时会中止启动，避免挂起的云 CLI 卡住整个 Session。若同时声明 `token_ttl_secs`，会话运行期间会按该值的一半自动重新执行并覆盖文件，因此长会话不会用到过期 token。密钥始终不进入 agent 容器；
 - 限流：路由可声明 `max_requests_per_minute`，超过预算的请求返回 429，避免被攻破的 agent 把凭据当作免费 API 额度；
 - 代理向上游发起**独立且经过证书校验**的 HTTPS 请求，再注入 `header` 指定的头部；
 - agent 从不与该上游建立 TLS，因此这不属于解密 agent 的 HTTPS；
@@ -31,15 +34,19 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 
 ## 审计证据的两个层次
 
-`session export` 写出的 JSON 同时带**哈希链**与**Ed25519 签名**，二者证明的事情不同：
+`session export` 写出的 JSON 同时带**哈希链**、**完整性封条**与 **Ed25519 签名**，三者证明的事情不同：
 
-| | 哈希链 | 签名 |
+| | 哈希链 | 封条 + 签名 |
 |---|---|---|
-| 证明什么 | 导出后**没有被改动、重排或删除** | 这份记录出自**持有该私钥的一方** |
-| 防不住什么 | 任何人都能为伪造事件生成一条自洽的链 | 私钥泄露则签名失去意义 |
-| 怎么验 | `verify <file>` | `verify <file> --pubkey <公钥>` |
+| 证明什么 | 导出后**没有被改动、重排或删除中间记录** | 这份记录出自**持有该私钥的一方**，且尾部没有被截断 |
+| 防不住什么 | 尾部截断；任何人都能为伪造事件生成一条自洽的链 | 私钥泄露，或验证者使用文件内嵌的公钥 |
+| 怎么验 | `verify <file>` | `verify <file> --pubkey <可信公钥>` |
 
-关键约束：**公钥必须来自你信任的渠道**（对方直接给你、或走你的配置管理），不能取自待验证的文件本身——否则任何人都能生成一对密钥、签一份伪造记录、再把公钥一起塞进文件，形成闭环。因此 `verify` 在未提供 `--pubkey` 时只报告"链完整"，不会声称来源可信。
+关键约束：**公钥必须来自你信任的渠道**（对方直接给你、或走你的配置管理），不能取自待验证的文件本身——否则任何人都能生成一对密钥、签一份伪造记录、再把公钥一起塞进文件，形成闭环。因此 `verify` 在未提供 `--pubkey` 时只报告"完整性封条有效（内嵌签名）"，不会声称来源可信。封条记录签名时的记录数和链根哈希，能发现没有私钥的尾部截断；但它不能替代可信公钥。
+
+`verify` 也支持 `evaluate`/`demo --export` 生成的 `AuditLedger`（`records` 格式）：它只校验每条记录的前序哈希与内容哈希，并明确报告"该导出没有签名，无法证明来源；链本身也不能发现尾部截断"。
+
+`session export` 会在签名前从 `proxy-state/requests/` 补建缺失的 CONNECT witness，因此即使 Session 进程被中断，已经记录的请求仍会进入导出。
 
 私钥存放于状态目录的 `signing-key.pk8`，权限 0600，首次导出时自动生成。它只在本机使用，不会随审计导出。
 

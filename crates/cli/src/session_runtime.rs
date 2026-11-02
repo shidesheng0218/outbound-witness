@@ -7,14 +7,14 @@ use outbound_witness_core::workspace::{
     apply_diff, collect_diff, snapshot_workspace, WorkspaceDiff,
 };
 use outbound_witness_core::{
-    evaluate_event, Destination, EnforcementMode, NetworkEvent, PolicyDecision,
-    ProcessIdentity, RuleConfig, WitnessEvent,
+    evaluate_event, Destination, EnforcementMode, NetworkEvent, PolicyDecision, ProcessIdentity,
+    RuleConfig, WitnessEvent,
 };
 use outbound_witness_proxy::{
     broker::CredentialRoute, evaluate_request_detailed, write_json, ApprovalGrant, ApprovalScope,
     DeniedRequest, PreAuthorization, ProxyConfig, ProxyDecision, ProxyMode, ProxyRequest,
 };
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -25,6 +25,9 @@ use std::{
 const POLICY_VERSION: &str = "session-v0.2";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+/// A token command that never returns must not block session startup or
+/// shutdown forever. Long cloud CLI calls usually finish in seconds.
+const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Serializes CLI mutations of the proxy control plane (approvals, denials,
 /// session records). Approve/deny are short-lived one-shot processes, so a
@@ -108,6 +111,23 @@ pub fn build_docker_agent_args(
         "-e".into(),
         "NO_PROXY=localhost,127.0.0.1".into(),
     ];
+    // External DNS resolution is not needed: the agent sends hostnames to the
+    // proxy via CONNECT. Pointing the upstream resolver at loopback closes the
+    // easiest DNS-tunnelling path out of the internal network. Container-name
+    // resolution (`proxy`) still comes from Docker's embedded resolver at
+    // 127.0.0.11. Set OW_AGENT_DNS=<server> to override, or OW_AGENT_DNS=none
+    // to leave Docker's default resolver in place.
+    match std::env::var("OW_AGENT_DNS") {
+        Ok(value) if value.is_empty() || value == "none" => {}
+        Ok(value) => {
+            args.push("--dns".into());
+            args.push(value);
+        }
+        Err(_) => {
+            args.push("--dns".into());
+            args.push("127.0.0.1".into());
+        }
+    }
     // Advertise the broker base URL only. The credential itself stays in the
     // proxy container, so the agent can call a route but never read the key.
     for route in &spec.credential_routes {
@@ -118,7 +138,11 @@ pub fn build_docker_agent_args(
             route.route
         ));
     }
-    args.push(spec.image.clone());
+    // Run the content-addressed digest captured at session start, not the tag.
+    // Otherwise a tag moved between `image inspect` and `docker run` would let
+    // the agent run different content than the approvals were bound to.
+    let image = spec.image_id.as_deref().unwrap_or(&spec.image);
+    args.push(image.to_string());
     args.extend(spec.command.iter().cloned());
     args
 }
@@ -229,6 +253,15 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
             ],
             None,
         )?;
+        // `docker run -d` succeeds even when the container exits immediately.
+        // Starting the agent without a live proxy would silently disable the
+        // only egress control the session has.
+        if !wait_for_container(&proxy_name, Duration::from_secs(5)) {
+            record.state = SessionState::Failed;
+            record.error = Some("代理容器未能保持运行".into());
+            let _ = save_session_record(&record);
+            return Err("代理容器未能保持运行，Session 不会在无出站控制的情况下启动".to_string());
+        }
         let handle = SessionHandle {
             session_id: record.spec.id.clone(),
             runtime_id: format!("ow-{}-agent", record.spec.id),
@@ -249,20 +282,47 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
             read_json_vec::<CredentialRoute>(&prepared.proxy_state_dir.join("broker.json")),
             prepared.proxy_state_dir.clone(),
         );
-        let output = run_docker_output(&agent_args)?;
+        let output = match run_docker_output(&agent_args) {
+            Ok(output) => output,
+            Err(error) => {
+                refresh.stop();
+                record.state = SessionState::Failed;
+                record.error = Some(error.clone());
+                record.handle = None;
+                let _ = save_session_record(&record);
+                return Err(error);
+            }
+        };
         refresh.stop();
-        record.state = if output.status_success {
+        let proxy_alive = container_is_running(&proxy_name);
+        record.state = if output.status_success && proxy_alive {
             SessionState::Completed
         } else {
             SessionState::Failed
         };
+        record.error = if !proxy_alive {
+            Some("代理容器在 Session 结束前已停止，出站证据不完整".into())
+        } else if !output.status_success {
+            Some(format!("agent 退出码 {}", output.exit_code))
+        } else {
+            None
+        };
         record.handle = None;
-        let _ = collect_session_diff(&record.spec.state_dir, &record.spec.id)?;
+        // Persist the terminal state before collecting the diff: a diff error
+        // must not leave the session stuck in Running.
+        save_session_record(&record)?;
+        let diff_result = collect_session_diff(&record.spec.state_dir, &record.spec.id);
         let mut refreshed = load_session_record(&record.spec.state_dir, &record.spec.id)?;
-        refreshed.state = record.state.clone();
         refreshed.handle = None;
+        if let Err(error) = diff_result {
+            refreshed.error = Some(format!("diff 采集失败: {error}"));
+            if refreshed.state == SessionState::Completed {
+                refreshed.state = SessionState::Failed;
+            }
+        }
         refreshed.network_intents = read_proxy_requests(&prepared.proxy_state_dir);
         save_session_record(&refreshed)?;
+        record.state = refreshed.state.clone();
         record_proxy_witnesses(&record.spec.state_dir, &record.spec.id)?;
         Ok(format!(
             "Session {}\n状态: {:?}\n容器退出码: {}\n{}",
@@ -296,6 +356,20 @@ pub fn build_proxy_args(
         "proxy".into(),
         "--mount".into(),
         format!("type=bind,source={},target=/state", state_dir.display()),
+        // The proxy holds usable credentials, so it gets the same treatment as
+        // an untrusted service: no capabilities, no privilege escalation, a
+        // read-only root filesystem, and a writable state mount only.
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges:true".into(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        "/tmp:rw,noexec,nosuid,size=8m".into(),
+        "--pids-limit".into(),
+        "256".into(),
+        "--memory".into(),
+        "512m".into(),
         "-e".into(),
         "OW_PROXY_STATE_DIR=/state".into(),
         "-e".into(),
@@ -314,6 +388,17 @@ pub fn build_proxy_args(
         args.push("-e".into());
         args.push(format!("OW_PROXY_IMAGE_ID={image_id}"));
     }
+    // Run as the owner of the state directory so the proxy can write request
+    // evidence without container root. On non-Unix hosts Docker Desktop
+    // handles ownership mapping itself.
+    if let Some(owner) = state_dir_owner(state_dir) {
+        args.push("--user".into());
+        args.push(owner);
+    }
+    if std::env::var_os("OW_PROXY_ALLOW_PRIVATE").is_some() {
+        args.push("-e".into());
+        args.push("OW_PROXY_ALLOW_PRIVATE".into());
+    }
     args.push("-e".into());
     args.push("OW_PROXY_BROKER_LISTEN=0.0.0.0:8080".into());
     // Credentials are passed to the proxy container only, by variable name, so
@@ -326,6 +411,19 @@ pub fn build_proxy_args(
     }
     args.push("outbound-witness/proxy:local".into());
     args
+}
+
+#[cfg(unix)]
+fn state_dir_owner(state_dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(state_dir)
+        .ok()
+        .map(|metadata| format!("{}:{}", metadata.uid(), metadata.gid()))
+}
+
+#[cfg(not(unix))]
+fn state_dir_owner(_state_dir: &Path) -> Option<String> {
+    None
 }
 
 #[derive(Debug)]
@@ -350,6 +448,29 @@ fn run_docker_output(args: &[String]) -> Result<DockerOutput, String> {
     let mut command = Command::new("docker");
     command.args(args);
     run_docker_output_from(command)
+}
+
+fn container_is_running(name: &str) -> bool {
+    Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Running}}", name])
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+        .unwrap_or(false)
+}
+
+fn wait_for_container(name: &str, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if container_is_running(name) {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn run_docker_output_from(mut command: Command) -> Result<DockerOutput, String> {
@@ -527,7 +648,22 @@ fn decision_source_note(source: &str) -> String {
         "credential_broker" => {
             "代理决定来自凭据路由（凭据由代理注入，未进入 agent 容器）".to_string()
         }
+        "blocked_target" => "代理拒绝：目标解析到非公网地址（SSRF 防护）".to_string(),
+        "connect_failed" => "代理已放行，但上游 TCP 连接失败".to_string(),
         other => format!("代理决定来自 CONNECT 授权（{other}）"),
+    }
+}
+
+/// Maps the decision the proxy recorded at runtime to its effect. Runtime
+/// decisions are authoritative: re-evaluating a TTL-bound grant at export time
+/// can turn an allowed request into a block just because its grant expired.
+fn decision_from_source(source: &str) -> Option<ProxyDecision> {
+    match source {
+        "observe" | "pre_authorized" | "manual_approval" | "credential_broker" => {
+            Some(ProxyDecision::Allow)
+        }
+        "denied" | "timeout" | "blocked_target" | "connect_failed" => Some(ProxyDecision::Block),
+        _ => None,
     }
 }
 
@@ -735,8 +871,8 @@ pub fn prepare_session(mut spec: SessionSpec) -> Result<SessionRecord, String> {
     if let Some(path) = spec.credential_routes_path.clone() {
         let source = fs::read_to_string(&path)
             .map_err(|error| format!("无法读取凭据路由文件 {path}: {error}"))?;
-        let routes: Vec<CredentialRoute> = serde_json::from_str(&source)
-            .map_err(|error| format!("凭据路由文件无效: {error}"))?;
+        let routes: Vec<CredentialRoute> =
+            serde_json::from_str(&source).map_err(|error| format!("凭据路由文件无效: {error}"))?;
         for route in &routes {
             route.validate()?;
         }
@@ -797,14 +933,19 @@ pub fn load_session_record(state_dir: &Path, session_id: &str) -> Result<Session
     serde_json::from_str(&source).map_err(|error| format!("Session 记录无效: {error}"))
 }
 
-
 pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), String> {
     let mut record = load_session_record(state_dir, session_id)?;
     let proxy_state = record
         .prepared
         .as_ref()
         .map(|prepared| prepared.proxy_state_dir.clone())
-        .unwrap_or_else(|| record.spec.state_dir.join(&record.spec.id).join("proxy-state"));
+        .unwrap_or_else(|| {
+            record
+                .spec
+                .state_dir
+                .join(&record.spec.id)
+                .join("proxy-state")
+        });
     let mut requests = read_proxy_request_records(&proxy_state);
     requests.sort_by(|left, right| {
         left.created_at_ms
@@ -834,19 +975,14 @@ pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), 
             &pre_authorizations,
             now_millis(),
         );
-        // The proxy records why it allowed a connection at runtime; fall back to
-        // the recomputed reason for request files written by older versions.
+        // The proxy records why it allowed or blocked a connection at runtime;
+        // fall back to the recomputed reason only for request files written by
+        // older versions that did not persist a decision.
         let source = request
             .decision_source
             .clone()
             .unwrap_or_else(|| evaluation_result.source.as_str().to_string());
-        let decision = if source == "credential_broker" {
-            // A brokered request is authorised by the credential route the
-            // operator supplied, not by a CONNECT approval.
-            ProxyDecision::Allow
-        } else {
-            evaluation_result.decision
-        };
+        let decision = decision_from_source(&source).unwrap_or(evaluation_result.decision);
         let mut event = witness_from_proxy_request(&record.spec, request, first_seen);
         let mut evaluation = evaluate_event(&event, &RuleConfig::default(), record.spec.mode);
         evaluation.decision = policy_decision_from_proxy(decision, record.spec.mode);
@@ -856,7 +992,9 @@ pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), 
             evaluation.explanation
         );
         event.consent = None;
-        record.audit.retain(|entry| entry.proxy_request_id.as_deref() != Some(request.request_id.as_str()));
+        record
+            .audit
+            .retain(|entry| entry.proxy_request_id.as_deref() != Some(request.request_id.as_str()));
         record.audit.push(SessionAuditRecord {
             session_id: record.spec.id.clone(),
             snapshot_hash: record
@@ -915,7 +1053,11 @@ fn witness_from_proxy_request(
         process: ProcessIdentity {
             pid: 0,
             executable: spec.image.clone(),
-            name: spec.command.first().cloned().unwrap_or_else(|| "session".into()),
+            name: spec
+                .command
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "session".into()),
             version: spec.image_id.clone(),
             signer: None,
             parent_pid: None,
@@ -979,9 +1121,28 @@ pub fn apply_session_diff(
         None => collect_session_diff(state_dir, session_id)?,
     };
     apply_diff(&diff.source_root, &diff.snapshot_root, &diff, paths)?;
-    if let Some(audit) = record.audit.last_mut() {
-        audit.writeback_result = Some(format!("applied: {}", paths.join(",")));
-    }
+    // A dedicated writeback record is stronger evidence than mutating the
+    // last audit entry: it says which diff was applied, to which paths, and
+    // becomes part of the hash chain.
+    record.audit.push(SessionAuditRecord {
+        session_id: record.spec.id.clone(),
+        snapshot_hash: record
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.snapshot_hash.clone())
+            .unwrap_or_default(),
+        runtime_digest: format!("{}:{}", record.spec.runtime, record.spec.image),
+        policy_version: POLICY_VERSION.into(),
+        image_id: record.spec.image_id.clone(),
+        approval_request: None,
+        approval_response: None,
+        diff_hash: Some(diff.diff_hash.clone()),
+        writeback_result: Some(format!("applied: {}", paths.join(","))),
+        event: None,
+        evaluation: None,
+        proxy_request_id: None,
+    });
+    record.diff = Some(diff);
     save_session_record(&record)
 }
 
@@ -990,6 +1151,10 @@ pub fn export_session_audit(
     session_id: &str,
     output: &Path,
 ) -> Result<(), String> {
+    // Backfill CONNECT evidence for sessions that ended without a clean
+    // shutdown. Without this, a Ctrl-C or a crashed desktop process would
+    // export a record with no proxy witnesses at all.
+    record_proxy_witnesses(state_dir, session_id)?;
     let mut record = load_session_record(state_dir, session_id)?;
     // Chain the audit before exporting so the file carries a verifiable digest
     // over its own contents, then sign it so the origin can be checked.
@@ -1083,7 +1248,8 @@ pub fn pending_requests(state_dir: &Path) -> Result<Vec<PendingRequestView>, Str
         let proxy_state = entry.path().join("proxy-state");
         let approvals = read_json_vec::<ApprovalGrant>(&proxy_state.join("approvals.json"));
         let denials = read_json_vec::<DeniedRequest>(&proxy_state.join("denials.json"));
-        let pre_authorizations = read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"));
+        let pre_authorizations =
+            read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"));
         let config = ProxyConfig {
             mode: if record.spec.mode == outbound_witness_core::EnforcementMode::Strict {
                 ProxyMode::Strict
@@ -1111,10 +1277,19 @@ pub fn pending_requests(state_dir: &Path) -> Result<Vec<PendingRequestView>, Str
                 &pre_authorizations,
                 now_millis(),
             );
-            let decision = match evaluation.decision {
-                outbound_witness_proxy::ProxyDecision::Allow => "allowed",
-                outbound_witness_proxy::ProxyDecision::Block => "denied",
-                outbound_witness_proxy::ProxyDecision::Pending => "pending",
+            let decision = match request
+                .decision_source
+                .as_deref()
+                .and_then(decision_from_source)
+            {
+                Some(outbound_witness_proxy::ProxyDecision::Allow) => "allowed",
+                Some(outbound_witness_proxy::ProxyDecision::Block) => "denied",
+                Some(outbound_witness_proxy::ProxyDecision::Pending) => "pending",
+                None => match evaluation.decision {
+                    outbound_witness_proxy::ProxyDecision::Allow => "allowed",
+                    outbound_witness_proxy::ProxyDecision::Block => "denied",
+                    outbound_witness_proxy::ProxyDecision::Pending => "pending",
+                },
             };
             let source = request
                 .decision_source
@@ -1216,14 +1391,52 @@ fn spec_from_command(command: &CliCommand) -> Result<SessionSpec, String> {
 /// Parses a host:port entry from --allow-host into a session-scoped rule.
 /// Runs a route's host-side token command and returns the trimmed stdout.
 fn run_token_command(route: &CredentialRoute) -> Result<String, String> {
+    run_token_command_with_timeout(route, TOKEN_COMMAND_TIMEOUT)
+}
+
+fn run_token_command_with_timeout(
+    route: &CredentialRoute,
+    timeout: Duration,
+) -> Result<String, String> {
     let command = route
         .token_command
         .as_ref()
         .ok_or_else(|| format!("路由 {} 没有 token_command", route.route))?;
-    let output = Command::new(&command[0])
+    let mut child = Command::new(&command[0])
         .args(&command[1..])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("执行 token_command 失败（{}）: {error}", route.route))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "token_command 超时（{}，{} 秒）；请缩短命令或改用 secret_env",
+                        route.route,
+                        timeout.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "等待 token_command 失败（{}）: {error}",
+                    route.route
+                ));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("读取 token_command 输出失败（{}）: {error}", route.route))?;
     if !output.status.success() {
         return Err(format!(
             "token_command 失败（{}）：{}",
@@ -1243,9 +1456,27 @@ fn write_route_secret(
     route: &CredentialRoute,
     secret: &str,
 ) -> Result<(), String> {
-    let credentials_dir = proxy_state_dir.join("credentials");
-    fs::create_dir_all(&credentials_dir).map_err(|error| error.to_string())?;
-    write_secret_file(&credentials_dir.join(&route.route), secret)
+    let relative = route
+        .secret_file
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| format!("凭据路由 {} 没有声明 secret_file", route.route))?;
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "凭据文件必须是 state 目录内的相对路径: {}",
+            relative.display()
+        ));
+    }
+    let path = proxy_state_dir.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_secret_file(&path, secret)
 }
 
 /// Renews short-lived credentials while the agent runs. The thread stops when
@@ -1366,8 +1597,7 @@ fn session_id(workspace: &Path) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let digest =
-        outbound_witness_core::sha256_hex(workspace.display().to_string().as_bytes());
+    let digest = outbound_witness_core::sha256_hex(workspace.display().to_string().as_bytes());
     format!("session-{millis}-{}", &digest[..10])
 }
 
@@ -1443,5 +1673,43 @@ pub fn probe_docker() -> RuntimeCapability {
             enforcement: "不可用".into(),
             message: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_route(command: Vec<&str>) -> CredentialRoute {
+        CredentialRoute {
+            route: "test".into(),
+            upstream_host: "api.example.test".into(),
+            upstream_port: 443,
+            header: "authorization".into(),
+            secret_env: None,
+            secret_file: Some("credentials/test".into()),
+            token_command: Some(command.into_iter().map(str::to_string).collect()),
+            token_ttl_secs: None,
+            max_requests_per_minute: None,
+            note: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_returns_trimmed_stdout() {
+        let route = token_route(vec!["sh", "-c", "printf '  token-value\\n'"]);
+        let value = run_token_command_with_timeout(&route, Duration::from_secs(5))
+            .expect("token command should succeed");
+        assert_eq!(value, "token-value");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_is_killed_after_the_timeout() {
+        let route = token_route(vec!["sh", "-c", "sleep 5; printf token"]);
+        let error = run_token_command_with_timeout(&route, Duration::from_millis(200))
+            .expect_err("a hanging token command must time out");
+        assert!(error.contains("超时"), "unexpected error: {error}");
     }
 }

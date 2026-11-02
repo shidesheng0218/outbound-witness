@@ -20,8 +20,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 pub fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
+    if !value.is_ascii() {
+        return Err("十六进制必须只包含 ASCII 字符".to_string());
+    }
     if !value.len().is_multiple_of(2) {
         return Err("十六进制长度必须是偶数".to_string());
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("无效的十六进制字符".to_string());
     }
     (0..value.len())
         .step_by(2)
@@ -81,25 +87,45 @@ pub fn sign_record(state_dir: &Path, record: &mut SessionRecord) -> Result<Strin
     Ok(public_key)
 }
 
-/// Checks the signature against a public key the caller trusts. Passing the key
-/// embedded in the file would prove nothing.
-pub fn verify_record(record: &SessionRecord, expected_public_key: &str) -> Result<(), String> {
+/// Checks the detached signature using the public key embedded in the file.
+/// This proves the sealed payload was produced by whoever holds that key; it
+/// does not prove that key belongs to the party you expect. Use
+/// `verify_record` with a key from a trusted channel for origin.
+pub fn verify_embedded_signature(record: &SessionRecord) -> Result<(), String> {
+    let signature = record
+        .signature
+        .as_ref()
+        .ok_or_else(|| "该导出没有签名，无法验证完整性".to_string())?;
+    let embedded = hex_decode(&signature.public_key)?;
+    verify_with_key(record, &embedded)
+}
+
+fn verify_with_key(record: &SessionRecord, key: &[u8]) -> Result<(), String> {
     let Some(signature) = &record.signature else {
         return Err("该导出没有签名，无法验证来源".to_string());
     };
     if signature.algorithm != "ed25519" {
         return Err(format!("不支持的签名算法: {}", signature.algorithm));
     }
+    let bytes = material(record)?;
+    let signature_bytes = hex_decode(&signature.value)?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&bytes, &signature_bytes)
+        .map_err(|_| "签名校验失败：内容与签名不匹配".to_string())
+}
+
+/// Checks the signature against a public key the caller trusts. Passing the key
+/// embedded in the file would prove nothing.
+pub fn verify_record(record: &SessionRecord, expected_public_key: &str) -> Result<(), String> {
+    let Some(signature) = &record.signature else {
+        return Err("该导出没有签名，无法验证来源".to_string());
+    };
     let expected = hex_decode(expected_public_key)?;
     let embedded = hex_decode(&signature.public_key)?;
     if expected != embedded {
         return Err("文件内嵌公钥与你提供的公钥不一致".to_string());
     }
-    let bytes = material(record)?;
-    let signature_bytes = hex_decode(&signature.value)?;
-    UnparsedPublicKey::new(&ED25519, expected)
-        .verify(&bytes, &signature_bytes)
-        .map_err(|_| "签名校验失败：内容与签名不匹配".to_string())
+    verify_with_key(record, &expected)
 }
 
 /// Accepts a public key either as a path to a file or as a hex string.
@@ -189,6 +215,28 @@ mod tests {
         let record = record();
         let error = verify_record(&record, "00").expect_err("no signature must be reported");
         assert!(error.contains("没有签名"), "unexpected error: {error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_multibyte_hex_is_rejected_without_panicking() {
+        assert!(hex_decode("€€").is_err());
+        assert!(hex_decode("zz").is_err());
+        assert!(hex_decode("0").is_err());
+    }
+
+    #[test]
+    fn embedded_signature_verifies_without_claiming_origin() {
+        let dir = temp_state("embedded");
+        let mut record = record();
+        sign_record(&dir, &mut record).unwrap();
+        assert!(verify_embedded_signature(&record).is_ok());
+
+        record.state = outbound_witness_core::session::SessionState::Failed;
+        assert!(
+            verify_embedded_signature(&record).is_err(),
+            "tampering must break the embedded signature too"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
