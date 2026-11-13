@@ -32,6 +32,8 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest upstream response header block accepted before giving up.
 const MAX_UPSTREAM_HEAD_BYTES: usize = 64 * 1024;
+/// Overall deadline for reading one request body from the agent.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One credential route. The secret value itself is never stored here: the route
 /// only says where the broker should resolve it at request time.
@@ -199,7 +201,24 @@ pub fn resolve_secret(state_dir: &Path, route: &CredentialRoute) -> Result<Strin
 fn is_valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~')
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
         })
 }
 
@@ -240,7 +259,9 @@ pub fn split_route(target: &str) -> Result<(String, String), String> {
 /// cannot make the broker speak to an arbitrary authority.
 pub fn parse_request_line(line: &str) -> Result<(String, String), String> {
     let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or_else(|| "broker 请求行为空".to_string())?;
+    let method = parts
+        .next()
+        .ok_or_else(|| "broker 请求行为空".to_string())?;
     let target = parts
         .next()
         .ok_or_else(|| "broker 请求缺少路径".to_string())?;
@@ -326,23 +347,43 @@ pub fn build_upstream_request(
     Ok(request)
 }
 
-fn read_head(stream: &mut TcpStream) -> Result<String, String> {
+/// Reads the header block and returns any bytes that arrived in the same
+/// socket read after `\r\n\r\n`. Those bytes are the beginning of the request
+/// body; discarding them would corrupt every POST whose headers and body are
+/// sent together.
+fn read_head(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+    let started = Instant::now();
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
-    while bytes.len() < MAX_HEADER_BYTES {
+    loop {
+        if started.elapsed() > crate::HEADER_READ_TIMEOUT {
+            return Err("读取 broker 请求头超时".to_string());
+        }
         let count = stream.read(&mut buffer).map_err(|e| e.to_string())?;
         if count == 0 {
-            break;
+            return Err("broker 连接在请求头完成前关闭".to_string());
         }
         bytes.extend_from_slice(&buffer[..count]);
-        if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(end) = find_header_end(&bytes) {
+            if end > MAX_HEADER_BYTES {
+                return Err(format!("broker 请求头超过 {MAX_HEADER_BYTES} 字节上限"));
+            }
+            let leftover = bytes.split_off(end);
+            let head = String::from_utf8(bytes)
+                .map_err(|error| format!("请求头不是有效 UTF-8: {error}"))?;
+            return Ok((head, leftover));
+        }
+        if bytes.len() > MAX_HEADER_BYTES {
+            return Err(format!("broker 请求头超过 {MAX_HEADER_BYTES} 字节上限"));
         }
     }
-    String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
-fn read_body(stream: &mut TcpStream, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
+fn read_body(
+    stream: &mut TcpStream,
+    headers: &[(String, String)],
+    mut buffered: Vec<u8>,
+) -> Result<Vec<u8>, String> {
     if header_value(headers, "transfer-encoding").is_some() {
         return Err("broker 不支持 chunked 请求体，请使用 Content-Length".to_string());
     }
@@ -350,7 +391,12 @@ fn read_body(stream: &mut TcpStream, headers: &[(String, String)]) -> Result<Vec
         Some(value) => value
             .parse::<usize>()
             .map_err(|_| format!("Content-Length 无效: {value}"))?,
-        None => return Ok(Vec::new()),
+        None => {
+            if buffered.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err("broker 收到没有 Content-Length 的多余请求体字节".to_string());
+        }
     };
     if length > MAX_BODY_BYTES {
         return Err(format!(
@@ -358,10 +404,29 @@ fn read_body(stream: &mut TcpStream, headers: &[(String, String)]) -> Result<Vec
             length, MAX_BODY_BYTES
         ));
     }
-    let mut body = vec![0_u8; length];
-    stream
-        .read_exact(&mut body)
-        .map_err(|error| format!("读取请求体失败: {error}"))?;
+    // Bytes beyond Content-Length would be a second pipelined request. The
+    // broker handles exactly one request per connection, so refuse rather than
+    // silently dropping or mixing them.
+    if buffered.len() > length {
+        return Err("broker 请求包含超出 Content-Length 的多余字节".to_string());
+    }
+    let mut body = Vec::with_capacity(length);
+    body.extend_from_slice(&buffered);
+    buffered.clear();
+    let started = Instant::now();
+    while body.len() < length {
+        if started.elapsed() > BODY_READ_TIMEOUT {
+            return Err("读取 broker 请求体超时".to_string());
+        }
+        let mut chunk = vec![0_u8; (length - body.len()).min(16 * 1024)];
+        let count = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("读取请求体失败: {error}"))?;
+        if count == 0 {
+            return Err("broker 请求体提前结束".to_string());
+        }
+        body.extend_from_slice(&chunk[..count]);
+    }
     Ok(body)
 }
 
@@ -415,7 +480,9 @@ fn relay_response(upstream: &mut impl Read, client: &mut TcpStream) -> Result<u6
     let mut headers_forwarded = false;
 
     loop {
-        let count = upstream.read(&mut buffer).map_err(|error| error.to_string())?;
+        let count = upstream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
         if count == 0 {
             break;
         }
@@ -483,7 +550,17 @@ fn record_broker_request(
 }
 
 fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> {
-    let head = read_head(&mut client)?;
+    let Some(_guard) = crate::ConnectionGuard::acquire() else {
+        write_error(
+            &mut client,
+            "503 Service Unavailable",
+            "broker 并发连接数超过上限",
+        );
+        return Ok(());
+    };
+    let _ = client.set_read_timeout(Some(crate::HEADER_READ_TIMEOUT));
+    let _ = client.set_write_timeout(Some(crate::HEADER_READ_TIMEOUT));
+    let (head, leftover) = read_head(&mut client)?;
     let request_line = head
         .lines()
         .next()
@@ -527,6 +604,14 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
         );
         return Ok(());
     }
+    if !crate::reserve_request_file() {
+        write_error(
+            &mut client,
+            "429 Too Many Requests",
+            "Session 请求记录数量超过上限",
+        );
+        return Ok(());
+    }
     let secret = match resolve_secret(state_dir, route) {
         Ok(secret) => secret,
         Err(error) => {
@@ -534,7 +619,7 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
             return Ok(());
         }
     };
-    let body = match read_body(&mut client, &headers) {
+    let body = match read_body(&mut client, &headers, leftover) {
         Ok(body) => body,
         Err(error) => {
             write_error(&mut client, "413 Payload Too Large", &error);
@@ -560,11 +645,16 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
         .write_all(&upstream_request)
         .and_then(|()| upstream.flush())
     {
-        write_error(&mut client, "502 Bad Gateway", &format!("写入上游失败: {error}"));
+        write_error(
+            &mut client,
+            "502 Bad Gateway",
+            &format!("写入上游失败: {error}"),
+        );
         return Ok(());
     }
     // Once the response starts streaming we can no longer send an HTTP error, so
     // a relay failure is logged and the connection is simply closed.
+    let _ = client.set_write_timeout(None);
     let relayed = match relay_response(&mut upstream, &mut client) {
         Ok(relayed) => relayed,
         Err(error) => {
@@ -572,7 +662,10 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
             return Ok(());
         }
     };
-    eprintln!("broker relayed {relayed} bytes from {}", route.upstream_host);
+    eprintln!(
+        "broker relayed {relayed} bytes from {}",
+        route.upstream_host
+    );
     record_broker_request(state_dir, route, body.len() as u64)
 }
 
@@ -580,8 +673,8 @@ fn handle_client(mut client: TcpStream, state_dir: &Path) -> Result<(), String> 
 /// proxy container serves both roles.
 pub fn serve(state_dir: PathBuf, listen: String) -> Result<(), String> {
     fs::create_dir_all(state_dir.join("requests")).map_err(|error| error.to_string())?;
-    let listener = TcpListener::bind(&listen)
-        .map_err(|error| format!("broker bind {listen}: {error}"))?;
+    let listener =
+        TcpListener::bind(&listen).map_err(|error| format!("broker bind {listen}: {error}"))?;
     for incoming in listener.incoming() {
         let client = incoming.map_err(|error| error.to_string())?;
         let state_dir = state_dir.clone();
@@ -645,7 +738,10 @@ mod tests {
     fn injects_the_credential_and_drops_everything_else() {
         let headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
-            ("authorization".to_string(), "Bearer agent-supplied".to_string()),
+            (
+                "authorization".to_string(),
+                "Bearer agent-supplied".to_string(),
+            ),
             ("x-api-key".to_string(), "agent-supplied".to_string()),
             ("host".to_string(), "evil.test".to_string()),
             ("cookie".to_string(), "session=1".to_string()),
@@ -751,7 +847,10 @@ mod tests {
     fn token_ttl_requires_a_token_command_and_must_be_positive() {
         let mut orphan = route();
         orphan.token_ttl_secs = Some(60);
-        assert!(orphan.validate().is_err(), "ttl without a command is meaningless");
+        assert!(
+            orphan.validate().is_err(),
+            "ttl without a command is meaningless"
+        );
 
         let mut zero = route();
         zero.secret_env = None;
@@ -799,10 +898,98 @@ mod tests {
     fn includes_the_port_in_host_header_only_when_non_default() {
         let mut custom = route();
         custom.upstream_port = 8443;
-        let text = String::from_utf8(
-            build_upstream_request(&custom, "GET", "/", &[], &[], "s").unwrap(),
-        )
-        .unwrap();
+        let text =
+            String::from_utf8(build_upstream_request(&custom, "GET", "/", &[], &[], "s").unwrap())
+                .unwrap();
         assert!(text.contains("Host: api.example.test:8443\r\n"));
+    }
+
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).expect("client should connect");
+        let (server, _) = listener.accept().expect("server should accept");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should be set");
+        (client, server)
+    }
+
+    fn request_with_body(body: &[u8]) -> Vec<u8> {
+        let mut request = format!(
+            "POST /anthropic/v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    #[test]
+    fn reads_a_body_sent_in_the_same_packet_as_the_headers() {
+        let (mut client, mut server) = socket_pair();
+        let payload = br#"{"model":"claude","stream":true}"#;
+        client
+            .write_all(&request_with_body(payload))
+            .expect("request should be written");
+        client.flush().unwrap();
+
+        let (head, leftover) = read_head(&mut server).expect("head should be read");
+        let headers = parse_headers(&head).expect("headers should parse");
+        let body = read_body(&mut server, &headers, leftover).expect("body should be read");
+        assert_eq!(body, payload, "no byte of the body may be discarded");
+    }
+
+    #[test]
+    fn reads_a_body_split_between_the_buffered_and_socket_bytes() {
+        let (mut client, mut server) = socket_pair();
+        let payload = b"hello world";
+        let request = request_with_body(payload);
+        let split = request.len() - 5;
+        client.write_all(&request[..split]).unwrap();
+        client.flush().unwrap();
+
+        let (head, leftover) = read_head(&mut server).expect("head should be read");
+        assert_eq!(leftover.len(), 6, "part of the body must be buffered");
+
+        client.write_all(&request[split..]).unwrap();
+        client.flush().unwrap();
+
+        let headers = parse_headers(&head).expect("headers should parse");
+        let body = read_body(&mut server, &headers, leftover).expect("body should be read");
+        assert_eq!(body, payload);
+    }
+
+    #[test]
+    fn rejects_bytes_beyond_the_declared_content_length() {
+        let (mut client, mut server) = socket_pair();
+        client
+            .write_all(b"POST /anthropic HTTP/1.1\r\nContent-Length: 1\r\n\r\nab")
+            .unwrap();
+        client.flush().unwrap();
+
+        let (head, leftover) = read_head(&mut server).expect("head should be read");
+        let headers = parse_headers(&head).expect("headers should parse");
+        let error =
+            read_body(&mut server, &headers, leftover).expect_err("extra bytes must be refused");
+        assert!(error.contains("多余"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_body_bytes_without_a_content_length() {
+        let (mut client, mut server) = socket_pair();
+        client
+            .write_all(b"POST /anthropic HTTP/1.1\r\nHost: api.example.test\r\n\r\nab")
+            .unwrap();
+        client.flush().unwrap();
+
+        let (head, leftover) = read_head(&mut server).expect("head should be read");
+        let headers = parse_headers(&head).expect("headers should parse");
+        let error =
+            read_body(&mut server, &headers, leftover).expect_err("unframed bytes must be refused");
+        assert!(
+            error.contains("Content-Length"),
+            "unexpected error: {error}"
+        );
     }
 }

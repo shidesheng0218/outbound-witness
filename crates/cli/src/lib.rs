@@ -9,11 +9,16 @@ use std::path::Path;
 
 pub mod session_runtime;
 pub mod signing;
+pub mod wrapper;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliCommand {
     pub name: String,
     pub mode: EnforcementMode,
+    /// True when `--mode` was given explicitly. Session start defaults to
+    /// Strict otherwise, because starting an enforcement session in Observe
+    /// mode by accident is the unsafe default.
+    pub mode_explicit: bool,
     pub json: bool,
     pub output: Option<String>,
     pub input: Option<String>,
@@ -65,6 +70,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--mode 需要 observe 或 strict".to_string())?;
                 command.mode = parse_mode(value)?;
+                command.mode_explicit = true;
                 index += 2;
             }
             "--json" => {
@@ -114,51 +120,83 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
 /// Re-derives the audit hash chain of an exported session record. Anyone can run
 /// this without trusting the process that produced the file: a single edited,
 /// reordered, or removed record makes the chain stop matching.
-fn verify_audit_file(
-    path: &Path,
-    json: bool,
-    public_key: Option<&str>,
-) -> Result<String, String> {
+fn verify_audit_file(path: &Path, json: bool, public_key: Option<&str>) -> Result<String, String> {
     let source = fs::read_to_string(path)
         .map_err(|error| format!("无法读取审计文件 {}: {error}", path.display()))?;
-    let record: SessionRecord = serde_json::from_str(&source)
-        .map_err(|error| format!("审计文件不是有效的 Session 导出: {error}"))?;
-    if let Err((index, reason)) = record.verify_audit_chain() {
-        return Err(format!(
-            "审计链校验失败：第 {} 条记录（共 {} 条）— {reason}",
-            index + 1,
-            record.audit.len()
-        ));
-    }
-    // The chain proves the file was not altered. Only a signature checked
-    // against a key from a trusted channel says who produced it, so the origin
-    // verdict is reported separately instead of being folded into the chain.
-    let origin = match public_key {
-        Some(value) => {
-            let expected = signing::read_public_key_argument(value)?;
-            signing::verify_record(&record, &expected)
-                .map_err(|error| format!("来源校验失败：{error}"))?;
-            "来源可信（签名与提供的公钥匹配）".to_string()
+    let document: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|error| format!("审计文件不是有效的 JSON: {error}"))?;
+
+    if document.get("spec").is_some() {
+        let record: SessionRecord = serde_json::from_value(document)
+            .map_err(|error| format!("审计文件不是有效的 Session 导出: {error}"))?;
+        if record.audit_seal.is_none() {
+            return Err(
+                "导出缺少完整性封条（audit_seal），无法证明记录未被截断；请用当前版本重新导出"
+                    .to_string(),
+            );
         }
-        None => match &record.signature {
-            Some(_) => "签名存在，但未提供 --pubkey，未校验来源".to_string(),
-            None => "该导出没有签名".to_string(),
-        },
-    };
-    if json {
-        Ok(format!(
-            "{{\"verified\":true,\"records\":{},\"session\":\"{}\",\"origin\":\"{}\"}}",
-            record.audit.len(),
-            record.spec.id,
-            origin
-        ))
+        if let Err((index, reason)) = record.verify_audit_chain() {
+            return Err(format!(
+                "审计链校验失败：第 {} 条记录（共 {} 条）— {reason}",
+                index + 1,
+                record.audit.len()
+            ));
+        }
+        // The chain proves the records are internally consistent. The embedded
+        // signature detects trailing truncation, because the seal is covered by
+        // the signature. Origin still requires a key from a trusted channel.
+        signing::verify_embedded_signature(&record)
+            .map_err(|error| format!("完整性封条校验失败：{error}"))?;
+        let origin = match public_key {
+            Some(value) => {
+                let expected = signing::read_public_key_argument(value)?;
+                signing::verify_record(&record, &expected)
+                    .map_err(|error| format!("来源校验失败：{error}"))?;
+                "来源可信（签名与提供的公钥匹配）".to_string()
+            }
+            None => "完整性封条有效（内嵌签名与记录一致）；未提供 --pubkey，未校验来源".to_string(),
+        };
+        if json {
+            Ok(format!(
+                "{{\"verified\":true,\"kind\":\"session\",\"records\":{},\"session\":\"{}\",\"origin\":\"{}\",\"sealed\":true}}",
+                record.audit.len(),
+                record.spec.id,
+                origin
+            ))
+        } else {
+            Ok(format!(
+                "审计链校验通过：{} 条记录，Session {}\n{}",
+                record.audit.len(),
+                record.spec.id,
+                origin
+            ))
+        }
+    } else if document.get("records").is_some() {
+        if public_key.is_some() {
+            return Err("基准事件导出没有签名，无法校验来源".to_string());
+        }
+        let ledger: AuditLedger = serde_json::from_value(document)
+            .map_err(|error| format!("审计文件不是有效的基准事件链: {error}"))?;
+        if let Err((index, reason)) = ledger.verify_chain() {
+            return Err(format!(
+                "基准事件链校验失败：第 {} 条记录（共 {} 条）— {reason}",
+                index + 1,
+                ledger.records.len()
+            ));
+        }
+        if json {
+            Ok(format!(
+                "{{\"verified\":true,\"kind\":\"ledger\",\"records\":{},\"origin\":\"unsigned\"}}",
+                ledger.records.len()
+            ))
+        } else {
+            Ok(format!(
+                "基准事件链校验通过：{} 条记录\n该导出没有签名，无法证明来源；链本身也不能发现尾部截断。",
+                ledger.records.len()
+            ))
+        }
     } else {
-        Ok(format!(
-            "审计链校验通过：{} 条记录，Session {}\n{}",
-            record.audit.len(),
-            record.spec.id,
-            origin
-        ))
+        Err("无法识别的审计文件格式：既不是 Session 导出，也不是基准事件链".to_string())
     }
 }
 
@@ -167,6 +205,7 @@ impl Default for CliCommand {
         Self {
             name: "help".into(),
             mode: EnforcementMode::Observe,
+            mode_explicit: false,
             json: false,
             output: None,
             input: None,
@@ -198,12 +237,9 @@ fn parse_session_args(args: &[String]) -> Result<CliCommand, String> {
         session_subcommand: args.get(2).cloned(),
         ..CliCommand::default()
     };
-    let subcommand = command
-        .session_subcommand
-        .as_deref()
-        .ok_or_else(|| {
-            "session 需要 start/status/requests/approve/deny/diff/apply/export/preauth".to_string()
-        })?;
+    let subcommand = command.session_subcommand.as_deref().ok_or_else(|| {
+        "session 需要 start/status/requests/approve/deny/diff/apply/export/preauth".to_string()
+    })?;
     let mut index = 3;
     while index < args.len() {
         if subcommand == "start" && args[index] == "--" {
@@ -216,6 +252,7 @@ fn parse_session_args(args: &[String]) -> Result<CliCommand, String> {
             }
             "--mode" => {
                 command.mode = parse_mode(&required_value(args, &mut index, "--mode")?)?;
+                command.mode_explicit = true;
             }
             "--state-dir" => {
                 command.state_dir = Some(required_value(args, &mut index, "--state-dir")?);
@@ -231,9 +268,11 @@ fn parse_session_args(args: &[String]) -> Result<CliCommand, String> {
             }
             "--ttl" => {
                 let value = required_value(args, &mut index, "--ttl")?;
-                command.ttl = Some(value.parse().map_err(|_| {
-                    format!("--ttl 需要正整数秒数，收到: {value}")
-                })?);
+                command.ttl = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--ttl 需要正整数秒数，收到: {value}"))?,
+                );
             }
             "--path" => {
                 command
@@ -314,6 +353,11 @@ fn parse_session_args(args: &[String]) -> Result<CliCommand, String> {
         {
             return Err(format!("session preauth {action} 需要 --host 和 --port"));
         }
+    }
+    if subcommand == "start" && !command.mode_explicit {
+        // A controlled session is an enforcement feature; requiring an
+        // explicit --mode observe to disable blocking keeps the safe default.
+        command.mode = EnforcementMode::Strict;
     }
     Ok(command)
 }
@@ -427,7 +471,7 @@ fn render_result(result: &EvaluationResult, mode: EnforcementMode) -> String {
 }
 
 fn help_text() -> String {
-    "用法:\n  outbound-witness status [--mode observe|strict] [--json]\n  outbound-witness demo [--mode observe|strict] [--json] [--export audit.json]\n  outbound-witness evaluate <event-or-benchmark.json> [--mode observe|strict] [--json] [--export audit.json]\n  outbound-witness doctor runtime [--json]\n  outbound-witness session start --workspace . [--mode strict] -- <command> [args...]\n  outbound-witness session status\n  outbound-witness session approve <request-id> --scope once|host|session [--ttl <seconds>]\n  outbound-witness session deny <request-id>\n  outbound-witness session requests [--json]\n  outbound-witness session diff <session-id>\n  outbound-witness session apply <session-id> --path path/to/file\n  outbound-witness session export <session-id> --output audit.json\n\n说明:\n  默认完全本地运行，不上传遥测，不解密 HTTPS，不保存文件正文。\n  evaluate 的风险分不决定 Session 出站。Session 严格模式对未批准的 HTTPS CONNECT 默认等待 120 秒后拒绝。\n  once 只放行这一次请求；host 放行该主机直到 --ttl；session 放行该主机直到会话结束，忽略 --ttl。".into()
+    "用法:\n  outbound-witness status [--mode observe|strict] [--json]\n  outbound-witness demo [--mode observe|strict] [--json] [--export audit.json]\n  outbound-witness evaluate <event-or-benchmark.json> [--mode observe|strict] [--json] [--export audit.json]\n  outbound-witness verify <audit.json> [--pubkey <hex-or-file>] [--json]\n  outbound-witness pubkey [--state-dir <dir>]\n  outbound-witness doctor runtime [--json]\n  outbound-witness session start --workspace . [--mode strict|observe] -- <command> [args...]\n  outbound-witness session status\n  outbound-witness session requests [--json]\n  outbound-witness session approve <request-id> --scope once|host|session [--ttl <seconds>]\n  outbound-witness session deny <request-id>\n  outbound-witness session preauth add|list|remove <session-id> [--host <host> --port <port>] [--ttl <seconds>]\n  outbound-witness session diff <session-id>\n  outbound-witness session apply <session-id> --path path/to/file\n  outbound-witness session export <session-id> --output audit.json\n\n说明:\n  默认完全本地运行，不上传遥测，不解密 HTTPS，不保存文件正文。\n  session start 未指定 --mode 时默认 strict；观察模式必须显式 --mode observe。\n  evaluate 的风险分不决定 Session 出站。Session 严格模式对未批准的 HTTPS CONNECT 默认等待 120 秒后拒绝；代理默认拒绝非公网解析目标。\n  once 只放行这一次请求；host 放行该主机直到 --ttl（不填则到会话结束）；session 放行该主机直到会话结束，忽略 --ttl。".into()
 }
 
 fn render_evaluation(mut event: WitnessEvent, command: &CliCommand) -> Result<String, String> {

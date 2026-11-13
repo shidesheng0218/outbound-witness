@@ -44,7 +44,10 @@ fn strict_network_policy_only_allows_explicit_hosts() {
 fn approval_request_times_out_to_block_and_allow_response_overrides_timeout() {
     let pending = ApprovalRequest::new("req-1".into(), "upload.example.test".into(), 1_000);
     assert_eq!(pending.timeout_ms, 120_000);
-    assert_eq!(approval_decision(&pending, 11_001), SessionDecision::Pending);
+    assert_eq!(
+        approval_decision(&pending, 11_001),
+        SessionDecision::Pending
+    );
     assert_eq!(approval_decision(&pending, 121_001), SessionDecision::Block);
 
     let allowed = ApprovalRequest {
@@ -116,6 +119,31 @@ fn apply_refuses_when_host_file_changed_after_diff() {
     );
 }
 
+#[test]
+fn apply_refuses_when_snapshot_changed_after_diff() {
+    let source = temp_dir("snapshot-change-source");
+    let snapshot = temp_dir("snapshot-change-snapshot");
+    fs::write(source.join("README.md"), "before").expect("source file should be written");
+    snapshot_workspace(&source, &snapshot, &default_exclusions()).expect("snapshot should succeed");
+    fs::write(snapshot.join("README.md"), "reviewed").expect("snapshot should be mutable");
+    let diff = collect_diff(&source, &snapshot, &default_exclusions()).expect("diff should work");
+
+    // The agent keeps editing the snapshot after the user reviewed the diff.
+    fs::write(snapshot.join("README.md"), "unreviewed").expect("snapshot should be mutable");
+
+    let error = apply_diff(&source, &snapshot, &diff, &["README.md".into()])
+        .expect_err("writeback must refuse bytes the user never reviewed");
+    assert!(
+        error.contains("快照在 diff 之后发生变化"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("README.md")).unwrap(),
+        "before",
+        "the host file must be left untouched when the snapshot no longer matches"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn apply_refuses_when_selected_path_traverses_symlink() {
@@ -134,7 +162,10 @@ fn apply_refuses_when_selected_path_traverses_symlink() {
 
     let error = apply_diff(&source, &snapshot, &diff, &["sub/file.txt".into()])
         .expect_err("writeback must refuse to follow a symlinked parent");
-    assert!(error.contains("符号链接"), "unexpected error message: {error}");
+    assert!(
+        error.contains("符号链接"),
+        "unexpected error message: {error}"
+    );
     assert!(
         !outside.join("file.txt").exists(),
         "nothing may be written through the symlink"

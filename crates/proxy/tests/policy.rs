@@ -1,7 +1,7 @@
 use outbound_witness_proxy::{
     evaluate_request, evaluate_request_detailed, evaluate_request_with_denials, next_request_id,
-    parse_connect_target, write_json, ApprovalGrant, ApprovalScope, DecisionSource,
-    DeniedRequest, PreAuthorization, ProxyConfig, ProxyDecision, ProxyMode, ProxyRequest,
+    parse_connect_target, write_json, ApprovalGrant, ApprovalScope, DecisionSource, DeniedRequest,
+    PreAuthorization, ProxyConfig, ProxyDecision, ProxyMode, ProxyRequest,
 };
 use std::collections::HashSet;
 
@@ -112,10 +112,7 @@ fn request_ids_are_unique_even_within_the_same_millisecond() {
 
 #[test]
 fn write_json_leaves_no_temp_files_and_round_trips() {
-    let dir = std::env::temp_dir().join(format!(
-        "ow-proxy-write-json-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("ow-proxy-write-json-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("approvals.json");
     let grant = ApprovalGrant {
@@ -141,7 +138,10 @@ fn write_json_leaves_no_temp_files_and_round_trips() {
                 .contains(".tmp-")
         })
         .count();
-    assert_eq!(leftovers, 0, "atomic write must not leave temp files behind");
+    assert_eq!(
+        leftovers, 0,
+        "atomic write must not leave temp files behind"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -317,7 +317,12 @@ fn grant_bound_to_port_does_not_cover_other_ports_on_same_host() {
         image_id: None,
     };
     assert_eq!(
-        evaluate_request(&request_on_port(443), &strict_config(), std::slice::from_ref(&grant), 5_000),
+        evaluate_request(
+            &request_on_port(443),
+            &strict_config(),
+            std::slice::from_ref(&grant),
+            5_000
+        ),
         ProxyDecision::Allow
     );
     assert_eq!(
@@ -511,9 +516,8 @@ fn grants_and_denials_without_port_field_deserialize_as_wildcard() {
     .expect("grants written before port binding must still deserialize");
     assert_eq!(grant.port, None);
 
-    let denial: DeniedRequest = serde_json::from_str(
-        r#"{"request_id":null,"host":"upload.example.test"}"#,
-    )
-    .expect("denials written before port binding must still deserialize");
+    let denial: DeniedRequest =
+        serde_json::from_str(r#"{"request_id":null,"host":"upload.example.test"}"#)
+            .expect("denials written before port binding must still deserialize");
     assert_eq!(denial.port, None);
 }

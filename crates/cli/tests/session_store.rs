@@ -6,7 +6,7 @@ use outbound_witness::session_runtime::{
 use outbound_witness_core::session::{EnforcementMode, SessionSpec, SessionState};
 use outbound_witness_proxy::ProxyRequest;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,13 @@ fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("outbound-witness-cli-{label}-{now}"));
     fs::create_dir_all(&path).expect("temp directory should be created");
     path
+}
+
+fn set_session_state(state: &Path, session_id: &str, next: SessionState) {
+    let mut record = load_session_record(state, session_id).expect("session should load");
+    record.state = next;
+    let path = state.join(session_id).join("session.json");
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
 }
 
 #[test]
@@ -86,7 +93,11 @@ fn export_signs_the_record_and_origin_verification_requires_the_right_key() {
     .expect("pubkey should print")
     .trim()
     .to_string();
-    assert_eq!(public_key.len(), 64, "an ed25519 public key is 32 bytes of hex");
+    assert_eq!(
+        public_key.len(),
+        64,
+        "an ed25519 public key is 32 bytes of hex"
+    );
 
     // Chain-only: the file is intact, but the origin is not claimed.
     let chain_only = run(vec![
@@ -108,7 +119,10 @@ fn export_signs_the_record_and_origin_verification_requires_the_right_key() {
         public_key,
     ])
     .expect("the right key must verify");
-    assert!(verified.contains("来源可信"), "unexpected output: {verified}");
+    assert!(
+        verified.contains("来源可信"),
+        "unexpected output: {verified}"
+    );
 
     let other_state = temp_dir("sign-other-state");
     let other_key = run(vec![
@@ -138,7 +152,10 @@ fn export_signs_the_record_and_origin_verification_requires_the_right_key() {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "the private key must not be group or world readable");
+        assert_eq!(
+            mode, 0o600,
+            "the private key must not be group or world readable"
+        );
     }
 }
 
@@ -165,7 +182,10 @@ fn exported_audit_carries_a_verifiable_chain_and_detects_tampering() {
         output.display().to_string(),
     ])
     .expect("an untampered export must verify");
-    assert!(verified.contains("校验通过"), "unexpected output: {verified}");
+    assert!(
+        verified.contains("校验通过"),
+        "unexpected output: {verified}"
+    );
 
     // Editing any audit field must break the chain.
     let mut tampered: serde_json::Value =
@@ -206,6 +226,153 @@ fn exported_audit_carries_a_verifiable_chain_and_detects_tampering() {
 }
 
 #[test]
+fn truncated_or_unsealed_exports_fail_verification() {
+    let workspace = temp_dir("seal-workspace");
+    let state = temp_dir("seal-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).unwrap();
+
+    // Dropping the last record and its chain entry leaves a valid prefix. The
+    // seal must catch it.
+    let mut truncated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    truncated["audit"].as_array_mut().unwrap().pop();
+    truncated["audit_chain"].as_array_mut().unwrap().pop();
+    let truncated_path = state.join("truncated.json");
+    fs::write(
+        &truncated_path,
+        serde_json::to_string_pretty(&truncated).unwrap(),
+    )
+    .unwrap();
+    let error = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        truncated_path.display().to_string(),
+    ])
+    .expect_err("a tail-truncated export must fail");
+    assert!(error.contains("校验失败"), "unexpected error: {error}");
+
+    // Removing the seal entirely is refused rather than silently accepted.
+    let mut unsealed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    unsealed.as_object_mut().unwrap().remove("audit_seal");
+    let unsealed_path = state.join("unsealed.json");
+    fs::write(
+        &unsealed_path,
+        serde_json::to_string_pretty(&unsealed).unwrap(),
+    )
+    .unwrap();
+    let error = run(vec![
+        "outbound-witness".into(),
+        "verify".into(),
+        unsealed_path.display().to_string(),
+    ])
+    .expect_err("an export without a seal must fail");
+    assert!(error.contains("完整性封条"), "unexpected error: {error}");
+}
+
+#[test]
+fn audit_trusts_the_runtime_allow_even_after_the_grant_expires() {
+    let workspace = temp_dir("runtime-allow-workspace");
+    let state = temp_dir("runtime-allow-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let proxy_state = state.join(&record.spec.id).join("proxy-state");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // A host grant without a TTL would have matched at runtime; re-evaluating
+    // now would see no grant and time out. The persisted decision wins.
+    let request = ProxyRequest {
+        request_id: "req-runtime-allow".into(),
+        host: "upload.example.test".into(),
+        port: 443,
+        created_at_ms: now_ms.saturating_sub(10_000),
+        bytes_sent: 128,
+        decision_source: Some("manual_approval".into()),
+    };
+    fs::write(
+        proxy_state.join("requests/req-runtime-allow.json"),
+        serde_json::to_string_pretty(&request).unwrap(),
+    )
+    .unwrap();
+
+    record_proxy_witnesses(&state, &record.spec.id).unwrap();
+    let restored = load_session_record(&state, &record.spec.id).unwrap();
+    let witness = restored
+        .audit
+        .iter()
+        .find(|entry| entry.proxy_request_id.as_deref() == Some("req-runtime-allow"))
+        .expect("the request must become a witness");
+    let evaluation = witness.evaluation.as_ref().unwrap();
+    assert_eq!(
+        evaluation.decision,
+        outbound_witness_core::PolicyDecision::Allow,
+        "an allowed request must not be reclassified because time passed"
+    );
+    assert!(evaluation.explanation.contains("人工批准"));
+}
+
+#[test]
+fn export_backfills_proxy_witnesses_after_an_unclean_end() {
+    let workspace = temp_dir("backfill-workspace");
+    let state = temp_dir("backfill-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let proxy_state = state.join(&record.spec.id).join("proxy-state");
+    let request = ProxyRequest {
+        request_id: "req-backfill".into(),
+        host: "backfill.example.test".into(),
+        port: 443,
+        created_at_ms: 1_000,
+        bytes_sent: 64,
+        decision_source: Some("observe".into()),
+    };
+    fs::write(
+        proxy_state.join("requests/req-backfill.json"),
+        serde_json::to_string_pretty(&request).unwrap(),
+    )
+    .unwrap();
+
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).unwrap();
+    let exported = fs::read_to_string(&output).unwrap();
+    assert!(exported.contains("backfill.example.test"));
+    let restored = load_session_record(&state, &record.spec.id).unwrap();
+    assert!(
+        restored
+            .audit
+            .iter()
+            .any(|entry| entry
+                .event
+                .as_ref()
+                .is_some_and(|event| event.network.destination.host == "backfill.example.test")),
+        "export must derive missing proxy witnesses before signing"
+    );
+}
+
+#[test]
 fn token_command_writes_a_private_credential_file_that_never_enters_the_record() {
     let workspace = temp_dir("cred-workspace");
     let state = temp_dir("cred-state");
@@ -214,7 +381,7 @@ fn token_command_writes_a_private_credential_file_that_never_enters_the_record()
     let routes_path = state.join("routes.json");
     fs::write(
         &routes_path,
-        r#"[{"route":"cloud","upstream_host":"api.example.test","header":"authorization","secret_file":"credentials/cloud","token_command":["sh","-c","printf %s short-lived-token"]}]"#,
+        r#"[{"route":"cloud","upstream_host":"api.example.test","header":"authorization","secret_file":"credentials/custom-token","token_command":["sh","-c","printf %s short-lived-token"]}]"#,
     )
     .unwrap();
 
@@ -231,23 +398,35 @@ fn token_command_writes_a_private_credential_file_that_never_enters_the_record()
         .join(&record.spec.id)
         .join("proxy-state")
         .join("credentials")
-        .join("cloud");
+        .join("custom-token");
     assert_eq!(
         fs::read_to_string(&secret_path).unwrap(),
         "short-lived-token"
+    );
+    assert!(
+        !state
+            .join(&record.spec.id)
+            .join("proxy-state")
+            .join("credentials")
+            .join("cloud")
+            .exists(),
+        "the secret must be written to the declared secret_file, not credentials/<route>"
     );
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the credential file must not be group or world readable");
+        assert_eq!(
+            mode, 0o600,
+            "the credential file must not be group or world readable"
+        );
     }
 
     assert_eq!(record.spec.credential_routes.len(), 1);
     assert_eq!(
         record.spec.credential_routes[0].secret_file.as_deref(),
-        Some("credentials/cloud")
+        Some("credentials/custom-token")
     );
     let serialized = serde_json::to_string(&record).unwrap();
     assert!(
@@ -277,8 +456,14 @@ fn a_failing_token_command_aborts_the_session() {
     spec.state_dir = state.clone();
     spec.credential_routes_path = Some(routes_path.display().to_string());
     let error = prepare_session(spec).expect_err("a failing token command must abort the session");
-    assert!(error.contains("token_command 失败"), "unexpected error: {error}");
-    assert!(error.contains("boom"), "the command stderr should be surfaced: {error}");
+    assert!(
+        error.contains("token_command 失败"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("boom"),
+        "the command stderr should be surfaced: {error}"
+    );
 }
 
 #[test]
@@ -382,12 +567,21 @@ fn collect_apply_and_export_keep_host_unchanged_until_selected_diff_is_applied()
         "before"
     );
     assert_eq!(diff.entries.len(), 2);
+    set_session_state(&state, &record.spec.id, SessionState::Completed);
     apply_session_diff(&state, &record.spec.id, &["main.rs".into()]).unwrap();
     assert_eq!(
         fs::read_to_string(workspace.join("main.rs")).unwrap(),
         "after"
     );
     assert!(!workspace.join("added.rs").exists());
+    let after_apply = load_session_record(&state, &record.spec.id).unwrap();
+    assert!(
+        after_apply
+            .audit
+            .iter()
+            .any(|entry| entry.writeback_result.as_deref() == Some("applied: main.rs")),
+        "each writeback must leave its own audit record"
+    );
 
     let audit = state.join("audit.html");
     export_session_audit(&state, &record.spec.id, &audit).expect("audit should export");
@@ -516,11 +710,19 @@ fn concurrent_approvals_never_lose_each_other() {
     assert!(first.join().unwrap().contains("已批准"));
     assert!(second.join().unwrap().contains("已批准"));
 
-    let approvals =
-        fs::read_to_string(proxy_state.join("approvals.json")).unwrap();
-    assert!(approvals.contains("a.example.test"), "lost approval a: {approvals}");
-    assert!(approvals.contains("b.example.test"), "lost approval b: {approvals}");
-    assert!(!state.join("control.lock").exists(), "lock file must be released");
+    let approvals = fs::read_to_string(proxy_state.join("approvals.json")).unwrap();
+    assert!(
+        approvals.contains("a.example.test"),
+        "lost approval a: {approvals}"
+    );
+    assert!(
+        approvals.contains("b.example.test"),
+        "lost approval b: {approvals}"
+    );
+    assert!(
+        !state.join("control.lock").exists(),
+        "lock file must be released"
+    );
 }
 
 #[test]
@@ -628,6 +830,21 @@ fn session_requests_lists_pending_allowed_and_denied_states() {
     write_request("req-list-pending");
     write_request("req-list-allowed");
     write_request("req-list-denied");
+    // A request the proxy allowed at runtime, whose grant would no longer match
+    // if the view were recomputed now.
+    fs::write(
+        proxy_state.join("requests/req-list-runtime-allow.json"),
+        serde_json::to_string_pretty(&ProxyRequest {
+            request_id: "req-list-runtime-allow".into(),
+            host: "runtime.example.test".into(),
+            port: 443,
+            created_at_ms: now_ms.saturating_sub(10_000),
+            bytes_sent: 0,
+            decision_source: Some("manual_approval".into()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
 
     // Approve one, deny one, leave one untouched.
     fs::write(
@@ -675,7 +892,7 @@ fn session_requests_lists_pending_allowed_and_denied_states() {
     .unwrap();
     let views: Vec<outbound_witness::session_runtime::PendingRequestView> =
         serde_json::from_str(&listed).unwrap();
-    assert_eq!(views.len(), 3);
+    assert_eq!(views.len(), 4);
     let decision_of = |request_id: &str| {
         views
             .iter()
@@ -685,6 +902,11 @@ fn session_requests_lists_pending_allowed_and_denied_states() {
     assert_eq!(decision_of("req-list-pending"), Some("pending"));
     assert_eq!(decision_of("req-list-allowed"), Some("allowed"));
     assert_eq!(decision_of("req-list-denied"), Some("denied"));
+    assert_eq!(
+        decision_of("req-list-runtime-allow"),
+        Some("allowed"),
+        "a persisted runtime allow must not be recomputed into a denial"
+    );
 }
 
 #[test]
@@ -768,7 +990,11 @@ fn recorded_proxy_requests_become_audited_witness_events() {
     record_proxy_witnesses(&state, &record.spec.id).unwrap();
     let again = load_session_record(&state, &record.spec.id).unwrap();
     assert_eq!(
-        again.audit.iter().filter(|entry| entry.event.is_some()).count(),
+        again
+            .audit
+            .iter()
+            .filter(|entry| entry.event.is_some())
+            .count(),
         2
     );
 
@@ -780,4 +1006,114 @@ fn recorded_proxy_requests_become_audited_witness_events() {
         .filter(|entry| entry.event.is_some())
         .all(|entry| entry.evaluation.is_some()));
     assert!(after_diff.diff.is_some());
+}
+
+#[test]
+fn apply_refuses_an_unfinished_session_or_a_diff_that_was_never_reviewed() {
+    let workspace = temp_dir("apply-guard-workspace");
+    let state = temp_dir("apply-guard-state");
+    fs::write(workspace.join("main.rs"), "before").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let snapshot = record.prepared.as_ref().unwrap().snapshot_dir.clone();
+    fs::write(snapshot.join("main.rs"), "after").unwrap();
+
+    // The session is still Preparing, so the snapshot may keep changing.
+    let error = apply_session_diff(&state, &record.spec.id, &["main.rs".into()])
+        .expect_err("an unfinished session must not write back");
+    assert!(error.contains("尚未结束"), "unexpected error: {error}");
+
+    // Finished, but the user never ran `session diff`.
+    set_session_state(&state, &record.spec.id, SessionState::Completed);
+    let error = apply_session_diff(&state, &record.spec.id, &["main.rs".into()])
+        .expect_err("a diff that was never reviewed must not be applied");
+    assert!(error.contains("session diff"), "unexpected error: {error}");
+
+    // After an explicit review the same writeback is allowed.
+    collect_session_diff(&state, &record.spec.id).unwrap();
+    apply_session_diff(&state, &record.spec.id, &["main.rs".into()]).unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("main.rs")).unwrap(),
+        "after"
+    );
+}
+
+#[test]
+fn export_fails_closed_when_request_evidence_is_corrupt() {
+    let workspace = temp_dir("corrupt-evidence-workspace");
+    let state = temp_dir("corrupt-evidence-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    fs::write(
+        state
+            .join(&record.spec.id)
+            .join("proxy-state")
+            .join("requests")
+            .join("req-corrupt.json"),
+        "{ this is not valid json",
+    )
+    .unwrap();
+
+    let error = export_session_audit(&state, &record.spec.id, &state.join("audit.json"))
+        .expect_err("damaged evidence must abort the export");
+    assert!(error.contains("请求记录损坏"), "unexpected error: {error}");
+}
+
+#[test]
+fn verification_rejects_fields_outside_the_signed_schema() {
+    let workspace = temp_dir("schema-workspace");
+    let state = temp_dir("schema-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).unwrap();
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+
+    fn add_top_level_field(document: &mut serde_json::Value) {
+        document["unsigned_note"] = serde_json::json!("added after signing");
+    }
+    fn add_nested_field(document: &mut serde_json::Value) {
+        document["spec"]["unsigned_note"] = serde_json::json!("added after signing");
+    }
+
+    for (label, mutate) in [
+        (
+            "top-level",
+            add_top_level_field as fn(&mut serde_json::Value),
+        ),
+        ("nested", add_nested_field),
+    ] {
+        let mut tampered = original.clone();
+        mutate(&mut tampered);
+        let path = state.join(format!("unknown-field-{label}.json"));
+        fs::write(&path, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+        let error = run(vec![
+            "outbound-witness".into(),
+            "verify".into(),
+            path.display().to_string(),
+        ])
+        .expect_err("fields outside the signed schema must be rejected");
+        assert!(
+            error.contains("unknown field") || error.contains("无效的 Session 导出"),
+            "{label} field was accepted: {error}"
+        );
+    }
 }

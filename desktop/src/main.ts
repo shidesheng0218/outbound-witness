@@ -66,7 +66,7 @@ app.innerHTML = `
         <h1>出站见证</h1>
         <p class="subtitle">看见谁在读取文件，谁在向外发出数据。</p>
       </div>
-      <span class="mode">观察模式</span>
+      <span class="mode">受控 Session</span>
     </header>
     <section class="hero">
       <h2>先看证据，再决定是否放行。</h2>
@@ -247,8 +247,8 @@ async function renderRequests() {
     const scopeSelect = el("select");
     scopeSelect.id = "approve-scope";
     for (const option of [
-      { value: "once", label: "仅此一次", selected: false },
-      { value: "host", label: "整个域名", selected: true },
+      { value: "once", label: "仅此一次", selected: true },
+      { value: "host", label: "整个域名（到 Session 结束）", selected: false },
       { value: "session", label: "整个 Session", selected: false },
     ]) {
       const node = el("option", undefined, option.label);
