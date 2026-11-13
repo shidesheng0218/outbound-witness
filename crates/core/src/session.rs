@@ -1,3 +1,4 @@
+use crate::events::FileActivityRecord;
 use crate::workspace::{WorkspaceDiff, WorkspaceManifest};
 use crate::{ConsentGrant, EvaluationResult, WitnessEvent};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 pub use crate::EnforcementMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     pub allowed_hosts: Vec<String>,
     pub proxy_required: bool,
@@ -40,6 +42,7 @@ pub fn network_allowed(policy: &NetworkPolicy, host: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSpec {
     pub id: String,
     pub workspace: PathBuf,
@@ -150,6 +153,7 @@ pub struct FileAccessEvent {
 /// never appears here: only the name of the environment variable that holds it
 /// inside the proxy container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialRouteSummary {
     pub route: String,
     pub upstream_host: String,
@@ -164,6 +168,7 @@ pub struct CredentialRouteSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkIntent {
     pub request_id: String,
     pub host: String,
@@ -182,6 +187,7 @@ pub enum ApprovalResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub request_id: String,
     pub host: String,
@@ -225,6 +231,7 @@ pub fn approval_decision(request: &ApprovalRequest, now_ms: u64) -> SessionDecis
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedSession {
     pub session_id: String,
     pub snapshot_dir: PathBuf,
@@ -233,6 +240,7 @@ pub struct PreparedSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionHandle {
     pub session_id: String,
     pub runtime_id: String,
@@ -250,6 +258,7 @@ pub struct RuntimeCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionAuditRecord {
     pub session_id: String,
     pub snapshot_hash: String,
@@ -272,6 +281,7 @@ pub struct SessionAuditRecord {
 
 /// Detached signature over an exported session record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditSignature {
     pub algorithm: String,
     /// Public key that produced the signature, hex encoded. Convenience only: a
@@ -279,6 +289,32 @@ pub struct AuditSignature {
     /// because anyone can mint a key pair and sign a fabricated record.
     pub public_key: String,
     pub value: String,
+    /// Optional Merkle tree hash proof for the entire audit chain,
+    /// allowing verification without re-hashing all records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    /// RFC 3339 timestamp when the signature was created. Use a local clock or
+    /// a trusted external time source for credibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<String>,
+    /// Optional transparent log entry ID (e.g., Rekor log ID or equivalent).
+    /// Anchors the signature to an external, append-only registry if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_entry_id: Option<String>,
+}
+
+impl AuditSignature {
+    /// Mark this signature as verified against a local clock and (optionally)
+    /// a transparent log. Useful for exporting verification metadata.
+    pub fn with_verification_proof(
+        mut self,
+        signed_at: String,
+        log_entry_id: Option<String>,
+    ) -> Self {
+        self.signed_at = Some(signed_at);
+        self.log_entry_id = log_entry_id;
+        self
+    }
 }
 
 /// Commitment to the complete audit chain. A hash chain alone cannot detect
@@ -286,12 +322,14 @@ pub struct AuditSignature {
 /// perfectly valid prefix. The seal records how many records were present and
 /// the final root at signing time, so a verifier can reject a shortened export.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditSeal {
     pub record_count: usize,
     pub root_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRecord {
     pub spec: SessionSpec,
     pub state: SessionState,
@@ -316,6 +354,9 @@ pub struct SessionRecord {
     /// seal as "completeness cannot be proven" rather than as valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_seal: Option<AuditSeal>,
+    /// File activity summary from observer (if available). Empty if no observer was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_activity: Option<FileActivityRecord>,
     pub error: Option<String>,
 }
 
@@ -334,6 +375,7 @@ impl SessionRecord {
             audit_chain: Vec::new(),
             signature: None,
             audit_seal: None,
+            file_activity: None,
             error: None,
         }
     }

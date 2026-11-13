@@ -15,7 +15,7 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 - 代理默认拒绝解析到环回、私网、链路本地、CGNAT、文档地址或云元数据地址的目标，并直接连接已解析的 IP。设置 `OW_PROXY_ALLOW_PRIVATE=1` 会关闭这一防护，只应在确实需要内网上游时使用。
 - 代理每个 Session 最多 256 个并发连接、5000 条请求记录，请求头和请求体读取都有超时；超出上限返回 503/429。proxy 容器以状态目录属主身份运行（Unix），并启用 `--cap-drop ALL`、`no-new-privileges`、只读根文件系统、pids/memory 限制。
 - agent 容器设置 `--dns 127.0.0.1`，尽量避免外部 DNS 解析成为绕过代理的旁路。是否完全阻断取决于 Docker 内嵌 DNS 的实现，部署时应结合实际 runtime 验证；需要外部解析时用 `OW_AGENT_DNS=<server>` 覆盖，`OW_AGENT_DNS=none` 恢复 Docker 默认。
-- 宿主工作区保持不变，直到用户执行 `outbound-witness session apply <id> --path <relative-path>`。写回前会核对宿主文件是否仍等于 diff 记录的 `before_sha256`，并拒绝父级包含符号链接的路径；任一冲突都会中止整次写回。
+- 宿主工作区保持不变，直到 Session 结束、用户运行 `session diff` 查看变更并执行 `outbound-witness session apply <id> --path <relative-path>`。写回前会核对宿主文件仍等于 diff 记录的 `before_sha256`、快照文件仍等于 `after_sha256`，并拒绝父级包含符号链接的路径；任一冲突都会中止整次写回。写入使用临时文件 + 原子替换，防止中断留下半截文件；每次写回后旧 diff 作废，必须重新查看才能再次 apply。
 
 ## 凭据外置（可选）
 
@@ -46,7 +46,7 @@ Outbound Witness v0.2 强保护适用于通过 `outbound-witness session start` 
 
 `verify` 也支持 `evaluate`/`demo --export` 生成的 `AuditLedger`（`records` 格式）：它只校验每条记录的前序哈希与内容哈希，并明确报告"该导出没有签名，无法证明来源；链本身也不能发现尾部截断"。
 
-`session export` 会在签名前从 `proxy-state/requests/` 补建缺失的 CONNECT witness，因此即使 Session 进程被中断，已经记录的请求仍会进入导出。
+`session export` 会在签名前从 `proxy-state/requests/` 补建缺失的 CONNECT witness，因此即使 Session 进程被中断，已经记录的请求仍会进入导出。读取请求记录时缺失目录或损坏文件会直接导致导出失败：静默跳过证据再生成一份签名审计，会让完整性声明掩盖证据缺口。审计文档采用严格 schema，出现未知字段会被拒绝，避免未签名的附加内容混入已签名文档。
 
 私钥存放于状态目录的 `signing-key.pk8`，权限 0600，首次导出时自动生成。它只在本机使用，不会随审计导出。
 

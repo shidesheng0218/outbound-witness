@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod session_runtime;
 pub mod signing;
+pub mod wrapper;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliCommand {

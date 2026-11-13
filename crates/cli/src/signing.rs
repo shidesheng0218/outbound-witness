@@ -83,6 +83,9 @@ pub fn sign_record(state_dir: &Path, record: &mut SessionRecord) -> Result<Strin
         algorithm: "ed25519".into(),
         public_key: public_key.clone(),
         value: hex_encode(signature.as_ref()),
+        root_hash: None,
+        signed_at: None,
+        log_entry_id: None,
     });
     Ok(public_key)
 }

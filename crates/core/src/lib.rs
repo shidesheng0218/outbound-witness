@@ -4,8 +4,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+pub mod events;
 pub mod platform;
 pub mod session;
+pub mod transparency;
 pub mod workspace;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +31,7 @@ pub enum FileEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub executable: String,
@@ -56,6 +59,7 @@ impl ProcessIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Destination {
     pub host: String,
     pub ip: Option<String>,
@@ -64,6 +68,7 @@ pub struct Destination {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkEvent {
     pub destination: Destination,
     pub bytes_sent: u64,
@@ -71,6 +76,7 @@ pub struct NetworkEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FileEvent {
     pub path: String,
     pub kind: FileEventKind,
@@ -80,6 +86,7 @@ pub struct FileEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConsentGrant {
     pub executable_sha256: String,
     pub process_version: String,
@@ -136,6 +143,7 @@ impl ConsentGrant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessEvent {
     pub process: ProcessIdentity,
     pub network: NetworkEvent,
@@ -154,9 +162,48 @@ impl WitnessEvent {
             self.process.executable_sha256 = self.process.compute_executable_sha256();
         }
     }
+
+    /// Constructs a witness event from a file access and the current network intent.
+    /// Used to link file activity to the network decision that follows it.
+    pub fn from_file_and_network(
+        file: &crate::events::FileAccessEvent,
+        network: &NetworkEvent,
+        process: ProcessIdentity,
+        archive_created: bool,
+        first_seen: bool,
+    ) -> Self {
+        Self {
+            process,
+            network: network.clone(),
+            file_events: vec![FileEvent {
+                path: file.path.clone(),
+                kind: match file.operation {
+                    crate::events::FileOperation::Read => FileEventKind::Read,
+                    crate::events::FileOperation::Execute => FileEventKind::Read,
+                    crate::events::FileOperation::Write => FileEventKind::Read,
+                    crate::events::FileOperation::Delete => FileEventKind::Read,
+                },
+                bytes: file.bytes_transferred,
+                sha256: file.sha256.clone(),
+                timestamp: format_timestamp_ms(file.timestamp_ms),
+            }],
+            archive_created,
+            first_seen_destination: first_seen,
+            consent: None,
+        }
+    }
+}
+
+fn format_timestamp_ms(ms: u64) -> String {
+    // Convert ms since epoch to RFC 3339 string. Naive implementation for now;
+    // in production would use chrono or time crate.
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    format!("1970-01-01T00:00:{:02}.{:03}Z", secs % 60, millis)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub sensitive_path_fragments: Vec<String>,
     pub batch_file_count: usize,
@@ -192,6 +239,7 @@ impl Default for RuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RiskSignal {
     pub code: String,
     pub points: u8,
@@ -199,6 +247,7 @@ pub struct RiskSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationResult {
     pub risk_score: u8,
     pub signals: Vec<RiskSignal>,
@@ -401,6 +450,7 @@ pub fn evaluate_event(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditRecord {
     pub event: WitnessEvent,
     pub evaluation: EvaluationResult,
@@ -409,6 +459,7 @@ pub struct AuditRecord {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditLedger {
     pub records: Vec<AuditRecord>,
 }

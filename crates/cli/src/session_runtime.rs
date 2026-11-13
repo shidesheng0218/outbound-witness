@@ -24,7 +24,7 @@ use std::{
 
 const POLICY_VERSION: &str = "session-v0.2";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 /// A token command that never returns must not block session startup or
 /// shutdown forever. Long cloud CLI calls usually finish in seconds.
 const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,8 +32,12 @@ const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Serializes CLI mutations of the proxy control plane (approvals, denials,
 /// session records). Approve/deny are short-lived one-shot processes, so a
 /// lock file with create_new + stale detection is enough; the atomic renames
-/// in `write_json` guarantee readers never see torn JSON.
-struct StateLock(PathBuf);
+/// in `write_json` guarantee readers never see torn JSON. The token keeps a
+/// process whose lock was taken over from deleting the new holder's lock.
+struct StateLock {
+    path: PathBuf,
+    token: String,
+}
 
 impl StateLock {
     fn acquire(state_dir: &Path) -> Result<Self, String> {
@@ -46,7 +50,18 @@ impl StateLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self(path)),
+                Ok(mut file) => {
+                    let token = format!(
+                        "{}-{}",
+                        std::process::id(),
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                    );
+                    let _ = io::Write::write_all(&mut file, token.as_bytes());
+                    return Ok(Self { path, token });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     if Self::is_stale(&path) {
                         let _ = fs::remove_file(&path);
@@ -74,7 +89,12 @@ impl StateLock {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Only remove the lock if it is still ours. If the stale-lock timeout
+        // let another process take over, deleting its lock would let a third
+        // writer in concurrently.
+        if fs::read_to_string(&self.path).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -226,14 +246,16 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
     ensure_image(&image)?;
     spec.image_id = Some(image_digest(&image)?);
     ensure_proxy_image()?;
-    let mut record = prepare_session(spec)?;
+    let record = prepare_session(spec)?;
+    let state_dir = record.spec.state_dir.clone();
+    let session_id = record.spec.id.clone();
     let prepared = record
         .prepared
         .clone()
         .ok_or_else(|| "Session 缺少 prepared state".to_string())?;
-    let internal_network = format!("ow-{}-internal", record.spec.id);
-    let egress_network = format!("ow-{}-egress", record.spec.id);
-    let proxy_name = format!("ow-{}-proxy", record.spec.id);
+    let internal_network = format!("ow-{session_id}-internal");
+    let egress_network = format!("ow-{session_id}-egress");
+    let proxy_name = format!("ow-{session_id}-proxy");
     create_network(&internal_network, true)?;
     create_network(&egress_network, false)?;
     let result = (|| {
@@ -257,19 +279,23 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
         // Starting the agent without a live proxy would silently disable the
         // only egress control the session has.
         if !wait_for_container(&proxy_name, Duration::from_secs(5)) {
-            record.state = SessionState::Failed;
-            record.error = Some("代理容器未能保持运行".into());
-            let _ = save_session_record(&record);
+            let _ = update_session_record(&state_dir, &session_id, |record| {
+                record.state = SessionState::Failed;
+                record.error = Some("代理容器未能保持运行".into());
+                Ok(())
+            });
             return Err("代理容器未能保持运行，Session 不会在无出站控制的情况下启动".to_string());
         }
         let handle = SessionHandle {
-            session_id: record.spec.id.clone(),
-            runtime_id: format!("ow-{}-agent", record.spec.id),
+            session_id: session_id.clone(),
+            runtime_id: format!("ow-{session_id}-agent"),
             proxy_id: proxy_name.clone(),
         };
-        record.handle = Some(handle.clone());
-        record.state = SessionState::Running;
-        save_session_record(&record)?;
+        update_session_record(&state_dir, &session_id, |record| {
+            record.handle = Some(handle);
+            record.state = SessionState::Running;
+            Ok(())
+        })?;
         let agent_args = build_docker_agent_args(
             &record.spec,
             &prepared.snapshot_dir,
@@ -277,57 +303,70 @@ fn run_docker_session(mut spec: SessionSpec) -> Result<String, String> {
             "proxy",
         );
         // Short-lived credentials are renewed while the agent runs, so a long
-        // session does not outlive its token.
-        let refresh = spawn_credential_refresh(
-            read_json_vec::<CredentialRoute>(&prepared.proxy_state_dir.join("broker.json")),
-            prepared.proxy_state_dir.clone(),
-        );
+        // session does not outlive its token. A corrupt broker file aborts the
+        // session instead of silently running without credential renewal.
+        let routes =
+            match read_json_vec::<CredentialRoute>(&prepared.proxy_state_dir.join("broker.json")) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    let _ = update_session_record(&state_dir, &session_id, |record| {
+                        record.state = SessionState::Failed;
+                        record.error = Some(error.clone());
+                        record.handle = None;
+                        Ok(())
+                    });
+                    return Err(error);
+                }
+            };
+        let refresh = spawn_credential_refresh(routes, prepared.proxy_state_dir.clone());
         let output = match run_docker_output(&agent_args) {
             Ok(output) => output,
             Err(error) => {
                 refresh.stop();
-                record.state = SessionState::Failed;
-                record.error = Some(error.clone());
-                record.handle = None;
-                let _ = save_session_record(&record);
+                let _ = update_session_record(&state_dir, &session_id, |record| {
+                    record.state = SessionState::Failed;
+                    record.error = Some(error.clone());
+                    record.handle = None;
+                    Ok(())
+                });
                 return Err(error);
             }
         };
         refresh.stop();
         let proxy_alive = container_is_running(&proxy_name);
-        record.state = if output.status_success && proxy_alive {
-            SessionState::Completed
-        } else {
-            SessionState::Failed
-        };
-        record.error = if !proxy_alive {
-            Some("代理容器在 Session 结束前已停止，出站证据不完整".into())
-        } else if !output.status_success {
-            Some(format!("agent 退出码 {}", output.exit_code))
-        } else {
-            None
-        };
-        record.handle = None;
-        // Persist the terminal state before collecting the diff: a diff error
-        // must not leave the session stuck in Running.
-        save_session_record(&record)?;
-        let diff_result = collect_session_diff(&record.spec.state_dir, &record.spec.id);
-        let mut refreshed = load_session_record(&record.spec.state_dir, &record.spec.id)?;
-        refreshed.handle = None;
-        if let Err(error) = diff_result {
-            refreshed.error = Some(format!("diff 采集失败: {error}"));
-            if refreshed.state == SessionState::Completed {
-                refreshed.state = SessionState::Failed;
-            }
+        update_session_record(&state_dir, &session_id, |record| {
+            record.state = if output.status_success && proxy_alive {
+                SessionState::Completed
+            } else {
+                SessionState::Failed
+            };
+            record.error = if !proxy_alive {
+                Some("代理容器在 Session 结束前已停止，出站证据不完整".into())
+            } else if !output.status_success {
+                Some(format!("agent 退出码 {}", output.exit_code))
+            } else {
+                None
+            };
+            record.handle = None;
+            Ok(())
+        })?;
+        // Collect the diff only after the terminal state is persisted, so a
+        // diff error cannot leave the session stuck in Running.
+        if let Err(error) = collect_session_diff(&state_dir, &session_id) {
+            let _ = update_session_record(&state_dir, &session_id, |record| {
+                record.error = Some(format!("diff 采集失败: {error}"));
+                if record.state == SessionState::Completed {
+                    record.state = SessionState::Failed;
+                }
+                Ok(())
+            });
         }
-        refreshed.network_intents = read_proxy_requests(&prepared.proxy_state_dir);
-        save_session_record(&refreshed)?;
-        record.state = refreshed.state.clone();
-        record_proxy_witnesses(&record.spec.state_dir, &record.spec.id)?;
+        record_proxy_witnesses(&state_dir, &session_id)?;
+        let final_record = load_session_record(&state_dir, &session_id)?;
         Ok(format!(
             "Session {}\n状态: {:?}\n容器退出码: {}\n{}",
-            record.spec.id,
-            record.state,
+            session_id,
+            final_record.state,
             output.exit_code,
             output.stdout.trim()
         ))
@@ -544,31 +583,6 @@ fn image_digest(image: &str) -> Result<String, String> {
     Ok(digest)
 }
 
-fn read_proxy_requests(state_dir: &Path) -> Vec<NetworkIntent> {
-    let mut intents = Vec::new();
-    let Ok(entries) = fs::read_dir(state_dir.join("requests")) else {
-        return intents;
-    };
-    for entry in entries.flatten() {
-        let Ok(source) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(request) = serde_json::from_str::<ProxyRequest>(&source) else {
-            continue;
-        };
-        intents.push(NetworkIntent {
-            request_id: request.request_id,
-            host: request.host,
-            port: request.port,
-            protocol: "https".into(),
-            timestamp: request.created_at_ms.to_string(),
-            bytes_sent: request.bytes_sent,
-        });
-    }
-    intents.sort_by(|left, right| left.request_id.cmp(&right.request_id));
-    intents
-}
-
 fn approve_request(command: &CliCommand) -> Result<String, String> {
     let state_dir = command_state_dir(command)?;
     let request_id = command.request_id.as_deref().unwrap();
@@ -587,7 +601,7 @@ fn approve_request(command: &CliCommand) -> Result<String, String> {
     let expires_at_ms = command
         .ttl
         .map(|ttl| now_millis().saturating_add(ttl.saturating_mul(1000)));
-    let mut approvals = read_json_vec::<ApprovalGrant>(&session_dir.join("approvals.json"));
+    let mut approvals = read_json_vec::<ApprovalGrant>(&session_dir.join("approvals.json"))?;
     approvals.push(ApprovalGrant {
         request_id: if scope == ApprovalScope::Once {
             Some(request.request_id.clone())
@@ -622,7 +636,7 @@ fn deny_request(command: &CliCommand) -> Result<String, String> {
     let request_id = command.request_id.as_deref().unwrap();
     let _lock = StateLock::acquire(&state_dir)?;
     let (session_dir, request) = find_proxy_request(&state_dir, request_id)?;
-    let mut denials = read_json_vec::<DeniedRequest>(&session_dir.join("denials.json"));
+    let mut denials = read_json_vec::<DeniedRequest>(&session_dir.join("denials.json"))?;
     denials.push(DeniedRequest {
         request_id: Some(request.request_id.clone()),
         host: request.host.clone(),
@@ -682,7 +696,7 @@ fn preauth_add(command: &CliCommand) -> Result<String, String> {
     let _lock = StateLock::acquire(&state_dir)?;
     let mut record = load_session_record(&state_dir, session_id)?;
     let path = preauth_file(&state_dir, session_id);
-    let mut rules = read_json_vec::<PreAuthorization>(&path);
+    let mut rules = read_json_vec::<PreAuthorization>(&path)?;
     let expires_at_ms = command
         .ttl
         .map(|ttl| now_millis().saturating_add(ttl.saturating_mul(1000)));
@@ -710,7 +724,7 @@ fn preauth_add(command: &CliCommand) -> Result<String, String> {
 fn preauth_list(command: &CliCommand) -> Result<String, String> {
     let state_dir = command_state_dir(command)?;
     let session_id = command.session_id.as_deref().unwrap();
-    let rules = read_json_vec::<PreAuthorization>(&preauth_file(&state_dir, session_id));
+    let rules = read_json_vec::<PreAuthorization>(&preauth_file(&state_dir, session_id))?;
     if command.json {
         return serde_json::to_string_pretty(&rules).map_err(|error| error.to_string());
     }
@@ -743,7 +757,7 @@ fn preauth_remove(command: &CliCommand) -> Result<String, String> {
     let port = command.port.unwrap();
     let _lock = StateLock::acquire(&state_dir)?;
     let path = preauth_file(&state_dir, session_id);
-    let mut rules = read_json_vec::<PreAuthorization>(&path);
+    let mut rules = read_json_vec::<PreAuthorization>(&path)?;
     let before = rules.len();
     rules.retain(|rule| !(rule.host == host && rule.port == port));
     write_json(&path, &rules)?;
@@ -835,11 +849,16 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn read_json_vec<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|source| serde_json::from_str(&source).ok())
-        .unwrap_or_default()
+/// Reads a JSON control file. A missing file is an empty list (first run),
+/// but an unreadable or corrupt file is an error: silently treating damaged
+/// approvals, denials, or evidence as empty would fail open.
+fn read_json_vec<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source)
+            .map_err(|error| format!("无法解析控制文件 {}: {error}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("无法读取控制文件 {}: {error}", path.display())),
+    }
 }
 
 pub fn prepare_session(mut spec: SessionSpec) -> Result<SessionRecord, String> {
@@ -934,6 +953,11 @@ pub fn load_session_record(state_dir: &Path, session_id: &str) -> Result<Session
 }
 
 pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), String> {
+    let _lock = StateLock::acquire(state_dir)?;
+    record_proxy_witnesses_locked(state_dir, session_id)
+}
+
+fn record_proxy_witnesses_locked(state_dir: &Path, session_id: &str) -> Result<(), String> {
     let mut record = load_session_record(state_dir, session_id)?;
     let proxy_state = record
         .prepared
@@ -946,15 +970,15 @@ pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), 
                 .join(&record.spec.id)
                 .join("proxy-state")
         });
-    let mut requests = read_proxy_request_records(&proxy_state);
+    let mut requests = read_proxy_request_records(&proxy_state)?;
     requests.sort_by(|left, right| {
         left.created_at_ms
             .cmp(&right.created_at_ms)
             .then_with(|| left.request_id.cmp(&right.request_id))
     });
-    let approvals = read_json_vec::<ApprovalGrant>(&proxy_state.join("approvals.json"));
-    let denials = read_json_vec::<DeniedRequest>(&proxy_state.join("denials.json"));
-    let pre_authorizations = read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"));
+    let approvals = read_json_vec::<ApprovalGrant>(&proxy_state.join("approvals.json"))?;
+    let denials = read_json_vec::<DeniedRequest>(&proxy_state.join("denials.json"))?;
+    let pre_authorizations = read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"))?;
     let mut seen_hosts = Vec::new();
     for request in &requests {
         let first_seen = !seen_hosts.iter().any(|host| host == &request.host);
@@ -1028,20 +1052,34 @@ pub fn record_proxy_witnesses(state_dir: &Path, session_id: &str) -> Result<(), 
     save_session_record(&record)
 }
 
-fn read_proxy_request_records(state_dir: &Path) -> Vec<ProxyRequest> {
-    let mut requests = Vec::new();
-    let Ok(entries) = fs::read_dir(state_dir.join("requests")) else {
-        return requests;
+fn is_request_record(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
     };
-    for entry in entries.flatten() {
-        let Ok(source) = fs::read_to_string(entry.path()) else {
+    !name.starts_with('.') && path.extension().and_then(|value| value.to_str()) == Some("json")
+}
+
+/// Reads every CONNECT evidence record. A missing requests directory or a
+/// corrupt record is an error: exporting a signed audit that silently omitted
+/// damaged evidence would be worse than refusing to export.
+fn read_proxy_request_records(state_dir: &Path) -> Result<Vec<ProxyRequest>, String> {
+    let requests_dir = state_dir.join("requests");
+    let entries = fs::read_dir(&requests_dir)
+        .map_err(|error| format!("无法读取请求记录目录 {}: {error}", requests_dir.display()))?;
+    let mut requests = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !is_request_record(&path) {
             continue;
-        };
-        if let Ok(request) = serde_json::from_str::<ProxyRequest>(&source) {
-            requests.push(request);
         }
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("无法读取请求记录 {}: {error}", path.display()))?;
+        let request = serde_json::from_str::<ProxyRequest>(&source)
+            .map_err(|error| format!("请求记录损坏 {}: {error}", path.display()))?;
+        requests.push(request);
     }
-    requests
+    Ok(requests)
 }
 
 fn witness_from_proxy_request(
@@ -1089,6 +1127,7 @@ fn policy_decision_from_proxy(decision: ProxyDecision, _mode: EnforcementMode) -
 }
 
 pub fn collect_session_diff(state_dir: &Path, session_id: &str) -> Result<WorkspaceDiff, String> {
+    let _lock = StateLock::acquire(state_dir)?;
     let mut record = load_session_record(state_dir, session_id)?;
     let snapshot = record
         .snapshot
@@ -1115,11 +1154,25 @@ pub fn apply_session_diff(
     if paths.is_empty() {
         return Err("session apply 至少需要一个 --path；默认不自动写回宿主工作区".into());
     }
+    let _lock = StateLock::acquire(state_dir)?;
     let mut record = load_session_record(state_dir, session_id)?;
-    let diff = match record.diff.clone() {
-        Some(diff) => diff,
-        None => collect_session_diff(state_dir, session_id)?,
-    };
+    // The snapshot belongs to the agent and can keep changing while a session
+    // runs. A writeback before the terminal state could apply bytes that differ
+    // from the diff the user reviewed, so it is refused outright.
+    match record.state {
+        SessionState::Completed | SessionState::Failed | SessionState::Blocked => {}
+        other => {
+            return Err(format!(
+                "Session 尚未结束（{:?}），拒绝写回；请等待 Session 结束并重新查看 diff 后再 apply",
+                other
+            ));
+        }
+    }
+    // Do not generate a diff implicitly: the user must have seen the entries
+    // they are about to copy onto the host. `session diff` records the diff.
+    let diff = record.diff.clone().ok_or_else(|| {
+        "尚未收集并查看 diff，拒绝写回；请先运行 `outbound-witness session diff <session-id>` 确认内容后再 apply".to_string()
+    })?;
     apply_diff(&diff.source_root, &diff.snapshot_root, &diff, paths)?;
     // A dedicated writeback record is stronger evidence than mutating the
     // last audit entry: it says which diff was applied, to which paths, and
@@ -1142,7 +1195,9 @@ pub fn apply_session_diff(
         evaluation: None,
         proxy_request_id: None,
     });
-    record.diff = Some(diff);
+    // The host now matches the selected snapshot entries, so the old diff is
+    // stale. Require a fresh `session diff` before any second writeback.
+    record.diff = None;
     save_session_record(&record)
 }
 
@@ -1151,10 +1206,11 @@ pub fn export_session_audit(
     session_id: &str,
     output: &Path,
 ) -> Result<(), String> {
+    let _lock = StateLock::acquire(state_dir)?;
     // Backfill CONNECT evidence for sessions that ended without a clean
     // shutdown. Without this, a Ctrl-C or a crashed desktop process would
     // export a record with no proxy witnesses at all.
-    record_proxy_witnesses(state_dir, session_id)?;
+    record_proxy_witnesses_locked(state_dir, session_id)?;
     let mut record = load_session_record(state_dir, session_id)?;
     // Chain the audit before exporting so the file carries a verifiable digest
     // over its own contents, then sign it so the origin can be checked.
@@ -1175,6 +1231,25 @@ fn save_session_record(record: &SessionRecord) -> Result<(), String> {
     write_json(&directory.join("session.json"), record)
 }
 
+/// Applies one mutation to the latest on-disk record under the control lock.
+/// Callers that keep a record in memory across a long operation must use this
+/// instead of saving their stale copy, otherwise an approval written by another
+/// process can be silently overwritten.
+fn update_session_record<F>(
+    state_dir: &Path,
+    session_id: &str,
+    mutate: F,
+) -> Result<SessionRecord, String>
+where
+    F: FnOnce(&mut SessionRecord) -> Result<(), String>,
+{
+    let _lock = StateLock::acquire(state_dir)?;
+    let mut record = load_session_record(state_dir, session_id)?;
+    mutate(&mut record)?;
+    save_session_record(&record)?;
+    Ok(record)
+}
+
 fn render_session_status(command: &CliCommand) -> Result<String, String> {
     let state_dir = command_state_dir(command)?;
     let mut records = Vec::new();
@@ -1186,9 +1261,12 @@ fn render_session_status(command: &CliCommand) -> Result<String, String> {
         if !entry.path().is_dir() {
             continue;
         }
-        if let Ok(record) = load_session_record(&state_dir, &entry.file_name().to_string_lossy()) {
-            records.push(record);
+        let session_id = entry.file_name().to_string_lossy().into_owned();
+        if !entry.path().join("session.json").exists() {
+            continue;
         }
+        let record = load_session_record(&state_dir, &session_id)?;
+        records.push(record);
     }
     records.sort_by(|left, right| left.spec.id.cmp(&right.spec.id));
     if command.json {
@@ -1242,14 +1320,15 @@ pub fn pending_requests(state_dir: &Path) -> Result<Vec<PendingRequestView>, Str
             continue;
         }
         let session_id = entry.file_name().to_string_lossy().into_owned();
-        let Ok(record) = load_session_record(state_dir, &session_id) else {
+        if !entry.path().join("session.json").exists() {
             continue;
-        };
+        }
+        let record = load_session_record(state_dir, &session_id)?;
         let proxy_state = entry.path().join("proxy-state");
-        let approvals = read_json_vec::<ApprovalGrant>(&proxy_state.join("approvals.json"));
-        let denials = read_json_vec::<DeniedRequest>(&proxy_state.join("denials.json"));
+        let approvals = read_json_vec::<ApprovalGrant>(&proxy_state.join("approvals.json"))?;
+        let denials = read_json_vec::<DeniedRequest>(&proxy_state.join("denials.json"))?;
         let pre_authorizations =
-            read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"));
+            read_json_vec::<PreAuthorization>(&proxy_state.join("preauth.json"))?;
         let config = ProxyConfig {
             mode: if record.spec.mode == outbound_witness_core::EnforcementMode::Strict {
                 ProxyMode::Strict
@@ -1259,16 +1338,19 @@ pub fn pending_requests(state_dir: &Path) -> Result<Vec<PendingRequestView>, Str
             approval_timeout_ms: record.spec.approval_timeout_secs * 1000,
             image_id: record.spec.image_id.clone(),
         };
-        let Ok(request_entries) = fs::read_dir(proxy_state.join("requests")) else {
-            continue;
-        };
-        for request_entry in request_entries.flatten() {
-            let Ok(source) = fs::read_to_string(request_entry.path()) else {
+        let requests_dir = proxy_state.join("requests");
+        let request_entries = fs::read_dir(&requests_dir)
+            .map_err(|error| format!("无法读取请求记录目录 {}: {error}", requests_dir.display()))?;
+        for request_entry in request_entries {
+            let request_entry = request_entry.map_err(|error| error.to_string())?;
+            let path = request_entry.path();
+            if !is_request_record(&path) {
                 continue;
-            };
-            let Ok(request) = serde_json::from_str::<ProxyRequest>(&source) else {
-                continue;
-            };
+            }
+            let source = fs::read_to_string(&path)
+                .map_err(|error| format!("无法读取请求记录 {}: {error}", path.display()))?;
+            let request = serde_json::from_str::<ProxyRequest>(&source)
+                .map_err(|error| format!("请求记录损坏 {}: {error}", path.display()))?;
             let evaluation = evaluate_request_detailed(
                 &request,
                 &config,

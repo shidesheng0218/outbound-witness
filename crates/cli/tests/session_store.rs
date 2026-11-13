@@ -6,7 +6,7 @@ use outbound_witness::session_runtime::{
 use outbound_witness_core::session::{EnforcementMode, SessionSpec, SessionState};
 use outbound_witness_proxy::ProxyRequest;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,13 @@ fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("outbound-witness-cli-{label}-{now}"));
     fs::create_dir_all(&path).expect("temp directory should be created");
     path
+}
+
+fn set_session_state(state: &Path, session_id: &str, next: SessionState) {
+    let mut record = load_session_record(state, session_id).expect("session should load");
+    record.state = next;
+    let path = state.join(session_id).join("session.json");
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
 }
 
 #[test]
@@ -560,6 +567,7 @@ fn collect_apply_and_export_keep_host_unchanged_until_selected_diff_is_applied()
         "before"
     );
     assert_eq!(diff.entries.len(), 2);
+    set_session_state(&state, &record.spec.id, SessionState::Completed);
     apply_session_diff(&state, &record.spec.id, &["main.rs".into()]).unwrap();
     assert_eq!(
         fs::read_to_string(workspace.join("main.rs")).unwrap(),
@@ -998,4 +1006,114 @@ fn recorded_proxy_requests_become_audited_witness_events() {
         .filter(|entry| entry.event.is_some())
         .all(|entry| entry.evaluation.is_some()));
     assert!(after_diff.diff.is_some());
+}
+
+#[test]
+fn apply_refuses_an_unfinished_session_or_a_diff_that_was_never_reviewed() {
+    let workspace = temp_dir("apply-guard-workspace");
+    let state = temp_dir("apply-guard-state");
+    fs::write(workspace.join("main.rs"), "before").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace.clone(),
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let snapshot = record.prepared.as_ref().unwrap().snapshot_dir.clone();
+    fs::write(snapshot.join("main.rs"), "after").unwrap();
+
+    // The session is still Preparing, so the snapshot may keep changing.
+    let error = apply_session_diff(&state, &record.spec.id, &["main.rs".into()])
+        .expect_err("an unfinished session must not write back");
+    assert!(error.contains("尚未结束"), "unexpected error: {error}");
+
+    // Finished, but the user never ran `session diff`.
+    set_session_state(&state, &record.spec.id, SessionState::Completed);
+    let error = apply_session_diff(&state, &record.spec.id, &["main.rs".into()])
+        .expect_err("a diff that was never reviewed must not be applied");
+    assert!(error.contains("session diff"), "unexpected error: {error}");
+
+    // After an explicit review the same writeback is allowed.
+    collect_session_diff(&state, &record.spec.id).unwrap();
+    apply_session_diff(&state, &record.spec.id, &["main.rs".into()]).unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("main.rs")).unwrap(),
+        "after"
+    );
+}
+
+#[test]
+fn export_fails_closed_when_request_evidence_is_corrupt() {
+    let workspace = temp_dir("corrupt-evidence-workspace");
+    let state = temp_dir("corrupt-evidence-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    fs::write(
+        state
+            .join(&record.spec.id)
+            .join("proxy-state")
+            .join("requests")
+            .join("req-corrupt.json"),
+        "{ this is not valid json",
+    )
+    .unwrap();
+
+    let error = export_session_audit(&state, &record.spec.id, &state.join("audit.json"))
+        .expect_err("damaged evidence must abort the export");
+    assert!(error.contains("请求记录损坏"), "unexpected error: {error}");
+}
+
+#[test]
+fn verification_rejects_fields_outside_the_signed_schema() {
+    let workspace = temp_dir("schema-workspace");
+    let state = temp_dir("schema-state");
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    let mut spec = SessionSpec::new(
+        workspace,
+        vec!["example-agent".into()],
+        EnforcementMode::Strict,
+    );
+    spec.state_dir = state.clone();
+    let record = prepare_session(spec).unwrap();
+    let output = state.join("audit.json");
+    export_session_audit(&state, &record.spec.id, &output).unwrap();
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+
+    fn add_top_level_field(document: &mut serde_json::Value) {
+        document["unsigned_note"] = serde_json::json!("added after signing");
+    }
+    fn add_nested_field(document: &mut serde_json::Value) {
+        document["spec"]["unsigned_note"] = serde_json::json!("added after signing");
+    }
+
+    for (label, mutate) in [
+        (
+            "top-level",
+            add_top_level_field as fn(&mut serde_json::Value),
+        ),
+        ("nested", add_nested_field),
+    ] {
+        let mut tampered = original.clone();
+        mutate(&mut tampered);
+        let path = state.join(format!("unknown-field-{label}.json"));
+        fs::write(&path, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+        let error = run(vec![
+            "outbound-witness".into(),
+            "verify".into(),
+            path.display().to_string(),
+        ])
+        .expect_err("fields outside the signed schema must be rejected");
+        assert!(
+            error.contains("unknown field") || error.contains("无效的 Session 导出"),
+            "{label} field was accepted: {error}"
+        );
+    }
 }

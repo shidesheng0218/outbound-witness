@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod policy;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
