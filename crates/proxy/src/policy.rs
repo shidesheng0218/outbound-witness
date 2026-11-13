@@ -56,7 +56,7 @@ pub struct BrokerPolicy {
 
 impl BrokerPolicy {
     /// Check if the given request (method, path, byte count) is allowed under this policy.
-    pub fn allows_request(&self, method: &str, path: &str, bytes_sent: u64) -> Result<(), String> {
+    pub fn allows_request(&self, method: &str, path: &str, _bytes_sent: u64) -> Result<(), String> {
         if !self.allowed_methods.is_empty() && !self.allowed_methods.contains(&method.to_string()) {
             return Err(format!(
                 "broker policy forbids method {} (allowed: {})",

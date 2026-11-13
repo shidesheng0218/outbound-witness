@@ -76,19 +76,19 @@ impl TransparencyLog for StubTransparencyLog {
 /// Requires network access. Entry IDs are UUIDs returned by Rekor.
 ///
 /// This is a reference implementation; real Rekor clients use the official SDK.
-#[cfg(feature = "rekor")]
+/// Currently gated behind manual feature flag (not in Cargo.toml yet).
+#[allow(dead_code)]
 pub struct RekorClient {
     base_url: String,
 }
 
-#[cfg(feature = "rekor")]
+#[allow(dead_code)]
 impl RekorClient {
     pub fn new(base_url: String) -> Self {
         Self { base_url }
     }
 }
 
-#[cfg(feature = "rekor")]
 impl TransparencyLog for RekorClient {
     fn submit(&self, _signed_export: &SignedExport) -> Result<TransparencyLogEntry, String> {
         // TODO: POST to Rekor API

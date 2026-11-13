@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::SystemTime;
 
 /// Runtime source for file/process events. Implementations can range from
 /// stubs (sampling, testing) to kernel-level (eBPF, ESF, ETW).
@@ -103,7 +102,7 @@ impl FileActivityRecord {
         self.total_bytes_read += event.bytes_transferred;
         self.accesses
             .entry(event.path.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(event);
     }
 
